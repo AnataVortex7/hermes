@@ -22,6 +22,13 @@ echo "Starting Hermes Agent..."
 hermes config set terminal.backend local
 hermes config set tools.enabled_toolsets '["core", "terminal", "python", "browser"]'
 
+# VERY IMPORTANT: Force Hermes to use your secure API Password from Environment
+if [ -n "$API_PASSWORD" ]; then
+    hermes config set model.api_key "$API_PASSWORD"
+else
+    echo "WARNING: API_PASSWORD is not set in Environment Variables!"
+fi
+
 # Start Hermes in gateway mode (Telegram/Discord listener)
 hermes gateway run || echo "Hermes failed to start."
 
