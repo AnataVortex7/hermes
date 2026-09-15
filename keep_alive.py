@@ -9,6 +9,10 @@ class PingHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Hermes Agent is Alive and Running!")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
 # Render provides the PORT environment variable
 port = int(os.environ.get("PORT", 10000))
 httpd = HTTPServer(('0.0.0.0', port), PingHandler)

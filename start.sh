@@ -19,9 +19,7 @@ echo "Starting Hermes Agent..."
 # if the main command fails, to keep the container alive so you can inspect it.
 
 # Start Hermes in gateway mode (Telegram/Discord listener)
-# If the exact command differs (like 'hermes run' or 'hermes gateway'), it will run here.
-hermes gateway install || echo "Gateway install skipped or failed."
-hermes start || echo "Hermes failed to start."
+hermes gateway run || echo "Hermes failed to start."
 
 # Keep container alive forever just in case Hermes crashes
 sleep infinity
