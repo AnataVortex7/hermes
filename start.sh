@@ -18,6 +18,10 @@ echo "Starting Hermes Agent..."
 # Note: Hermes CLI might require manual setup first time, so we just run a sleep loop 
 # if the main command fails, to keep the container alive so you can inspect it.
 
+# Enable all super-powers (Tools) for Hermes so it can create files and run code
+hermes config set terminal.backend local
+hermes config set tools.enabled_toolsets '["core", "terminal", "python", "browser"]'
+
 # Start Hermes in gateway mode (Telegram/Discord listener)
 hermes gateway run || echo "Hermes failed to start."
 
