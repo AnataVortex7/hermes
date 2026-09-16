@@ -77,6 +77,7 @@ hermes config set terminal.backend local || true
 hermes config set model.base_url "https://unknown44.onrender.com/v1swapnpurti118" || true
 hermes config set model.api_key "Swapnpurti@1181" || true
 hermes config set model.provider "custom" || true
+hermes config set model.default "custom/gemini-pro" || true
 hermes gateway run || echo ">> Hermes gateway exited."
 
 cleanup
