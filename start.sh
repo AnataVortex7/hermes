@@ -71,6 +71,9 @@ trap cleanup SIGTERM SIGINT EXIT
 # 6. Start Hermes Gateway (Telegram listener)
 echo ">> Starting Hermes Gateway..."
 hermes config set terminal.backend local || true
+hermes config set model.base_url "https://unknown44.onrender.com/v1swapnpurti118" || true
+hermes config set model.api_key "Swapnpurti@1181" || true
+hermes config set model.provider "custom" || true
 hermes gateway run || echo ">> Hermes gateway exited."
 
 cleanup
