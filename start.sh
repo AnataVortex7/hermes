@@ -1,5 +1,6 @@
 #!/bin/bash
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+export TZ="Asia/Kolkata"
 
 echo "=== [Hermes Koyeb Instant Startup & Background Sync] ==="
 
@@ -13,7 +14,7 @@ fi
 export OPENAI_API_BASE="${OPENAI_API_BASE:-https://unknown44.onrender.com/v1swapnpurti118}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-Swapnpurti@1181}"
 export MODEL_PROVIDER="custom"
-export MODEL_DEFAULT="auto"
+export MODEL_DEFAULT="gemini-pro"
 
 # 2. Setup Rclone configuration
 mkdir -p ~/.config/rclone
@@ -38,7 +39,7 @@ REMOTE_BACKUP="${RCLONE_REMOTE:-gdrive:hermes_backup}"
 if [ -f ~/.config/rclone/rclone.conf ]; then
     echo ">> Restoring Hermes state from Google Drive ($REMOTE_BACKUP)..."
     mkdir -p ~/.hermes
-    rclone sync "$REMOTE_BACKUP" ~/.hermes/ --include "/config.yaml" --include "/memories/**" --include "/sessions/**" --include "/state.db*" --include "/skills/**" --include "/cron/**" --include "/.env" --include "/shared-state.db" --drive-chunk-size 8M || echo ">> Restore skipped."
+    rclone sync "$REMOTE_BACKUP" ~/.hermes/ --include "/config.yaml" --include "/memories/**" --include "/sessions/**" --include "/state.db*" --include "/skills/**" --include "/cron/**" --include "/.env" --include "/shared-state.db" --include "/channel_directory.json" --drive-chunk-size 8M || echo ">> Restore skipped."
 fi
 
 # 4. Auto-clean Caches & Background Sync Loop (runs every 10 minutes)
@@ -49,13 +50,13 @@ clean_caches() {
 sync_to_cloud() {
     clean_caches
     if [ -f ~/.config/rclone/rclone.conf ]; then
-        rclone sync ~/.hermes/ "$REMOTE_BACKUP" --include "/config.yaml" --include "/memories/**" --include "/sessions/**" --include "/state.db*" --include "/skills/**" --include "/cron/**" --include "/.env" --include "/shared-state.db" --drive-chunk-size 8M --fast-list || true
+        rclone sync ~/.hermes/ "$REMOTE_BACKUP" --include "/config.yaml" --include "/memories/**" --include "/sessions/**" --include "/state.db*" --include "/skills/**" --include "/cron/**" --include "/.env" --include "/shared-state.db" --include "/channel_directory.json" --drive-chunk-size 8M --fast-list || true
     fi
 }
 
 (
     while true; do
-        sleep 600
+        sleep 60
         sync_to_cloud
     done
 ) &
@@ -77,7 +78,7 @@ hermes config set terminal.backend local || true
 hermes config set model.base_url "https://unknown44.onrender.com/v1swapnpurti118" || true
 hermes config set model.api_key "Swapnpurti@1181" || true
 hermes config set model.provider "custom" || true
-hermes config set model.default "custom/auto" || true
+hermes config set model.default "custom/gemini-pro" || true
 hermes gateway run || echo ">> Hermes gateway exited."
 
 cleanup
