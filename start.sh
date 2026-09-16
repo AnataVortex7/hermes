@@ -1,5 +1,6 @@
 #!/bin/bash
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+export TZ="Asia/Kolkata"
 
 echo "=== [Hermes Koyeb Instant Startup & Background Sync] ==="
 
@@ -55,7 +56,7 @@ sync_to_cloud() {
 
 (
     while true; do
-        sleep 600
+        sleep 60
         sync_to_cloud
     done
 ) &
