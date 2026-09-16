@@ -9,6 +9,9 @@ if [ -f /app/keep_alive.py ]; then
     python3 /app/keep_alive.py &
 fi
 
+# Set Custom API Endpoint from Environment Variables
+# (Set OPENAI_API_BASE and OPENAI_API_KEY in Koyeb Dashboard)
+
 # 2. Setup Rclone configuration
 mkdir -p ~/.config/rclone
 
