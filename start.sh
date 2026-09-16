@@ -39,7 +39,7 @@ REMOTE_BACKUP="${RCLONE_REMOTE:-gdrive:hermes_backup}"
 if [ -f ~/.config/rclone/rclone.conf ]; then
     echo ">> Restoring Hermes state from Google Drive ($REMOTE_BACKUP)..."
     mkdir -p ~/.hermes
-    rclone sync "$REMOTE_BACKUP" ~/.hermes/ --include "/config.yaml" --include "/memories/**" --include "/sessions/**" --include "/state.db*" --include "/skills/**" --include "/cron/**" --include "/.env" --include "/shared-state.db" --drive-chunk-size 8M || echo ">> Restore skipped."
+    rclone sync "$REMOTE_BACKUP" ~/.hermes/ --include "/config.yaml" --include "/memories/**" --include "/sessions/**" --include "/state.db*" --include "/skills/**" --include "/cron/**" --include "/.env" --include "/shared-state.db" --include "/channel_directory.json" --drive-chunk-size 8M || echo ">> Restore skipped."
 fi
 
 # 4. Auto-clean Caches & Background Sync Loop (runs every 10 minutes)
@@ -50,7 +50,7 @@ clean_caches() {
 sync_to_cloud() {
     clean_caches
     if [ -f ~/.config/rclone/rclone.conf ]; then
-        rclone sync ~/.hermes/ "$REMOTE_BACKUP" --include "/config.yaml" --include "/memories/**" --include "/sessions/**" --include "/state.db*" --include "/skills/**" --include "/cron/**" --include "/.env" --include "/shared-state.db" --drive-chunk-size 8M --fast-list || true
+        rclone sync ~/.hermes/ "$REMOTE_BACKUP" --include "/config.yaml" --include "/memories/**" --include "/sessions/**" --include "/state.db*" --include "/skills/**" --include "/cron/**" --include "/.env" --include "/shared-state.db" --include "/channel_directory.json" --drive-chunk-size 8M --fast-list || true
     fi
 }
 
