@@ -10,7 +10,10 @@ if [ -f /app/keep_alive.py ]; then
 fi
 
 # Set Custom API Endpoint from Environment Variables
-# (Set OPENAI_API_BASE and OPENAI_API_KEY in Koyeb Dashboard)
+export OPENAI_API_BASE="${OPENAI_API_BASE:-https://unknown44.onrender.com/v1swapnpurti118}"
+export OPENAI_API_KEY="${OPENAI_API_KEY:-Swapnpurti@1181}"
+export MODEL_PROVIDER="custom"
+export MODEL_DEFAULT="gemini-pro"
 
 # 2. Setup Rclone configuration
 mkdir -p ~/.config/rclone
