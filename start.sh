@@ -11,7 +11,7 @@ if [ -f /app/keep_alive.py ]; then
 fi
 
 # Set Custom API Endpoint from Environment Variables
-export OPENAI_API_BASE="${OPENAI_API_BASE:-https://unknown44.onrender.com/v1}"
+export OPENAI_API_BASE="https://unknown44.onrender.com/v1/"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-Swapnpurti@1181}"
 export MODEL_PROVIDER="custom"
 export MODEL_DEFAULT="gemini-pro"
@@ -75,7 +75,7 @@ trap cleanup SIGTERM SIGINT EXIT
 # 6. Start Hermes Gateway (Telegram listener)
 echo ">> Starting Hermes Gateway..."
 hermes config set terminal.backend local || true
-hermes config set model.base_url "$OPENAI_API_BASE" || true
+hermes config set model.base_url "https://unknown44.onrender.com/v1/" || true
 hermes config set model.api_key "$OPENAI_API_KEY" || true
 hermes config set model.provider "custom" || true
 hermes config set model.default "custom/gemini-pro" || true
