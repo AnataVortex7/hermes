@@ -35,10 +35,13 @@ if [ -f ~/.config/rclone/rclone.conf ]; then
     rclone sync "$REMOTE_BACKUP" ~/.hermes/ --exclude "cache/**" --exclude "audio_cache/**" --exclude "image_cache/**" --exclude "runtime/**" --drive-chunk-size 8M || echo ">> Restore skipped."
 fi
 
-# Symlink Himalaya config
+# Symlink Himalaya config and binary
 mkdir -p ~/.config/himalaya
 if [ -f ~/.hermes/skills/email/himalaya/config.toml ]; then
     ln -sf ~/.hermes/skills/email/himalaya/config.toml ~/.config/himalaya/config.toml
+fi
+if [ -f ~/.hermes/bin/himalaya ] && [ ! -f /usr/local/bin/himalaya ]; then
+    ln -sf ~/.hermes/bin/himalaya /usr/local/bin/himalaya
 fi
 
 # 4. Background Sync Loop (Every 1 Minute)
