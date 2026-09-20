@@ -32,17 +32,21 @@ if [ -f ~/.config/rclone/rclone.conf ]; then
     rclone sync "$REMOTE_BACKUP" ~/.hermes/ --exclude "cache/**" --exclude "audio_cache/**" --exclude "image_cache/**" --exclude "runtime/**" --drive-chunk-size 8M || echo ">> Restore skipped."
 fi
 
-# 4. Point Hermes at the wapi round-robin proxy.
-# "auto" tells wapi's smart_router.py to round-robin across ALL of its keys/models
-# for every request -- see AnataVortex7/wapi smart_router.py: is_round_robin check.
+# 4. Point Hermes at the wapi round-robin proxy via the BUILT-IN "OpenAI"
+# provider -- this is the one that actually does live model discovery
+# against wapi's /v1/models (it showed the full 50+ model list correctly).
+# The separate "custom" provider entry does NOT do live discovery, so we
+# no longer configure model.provider: custom at all.
+# NOTE: no trailing slash here -- hermes appends "/chat/completions" itself,
+# and a trailing slash produced a double slash (".../v1//chat/completions")
+# which does not match wapi's exact Flask route, causing HTTP 404.
 export OPENAI_API_KEY="Swapnpurti@1181"
-export OPENAI_BASE_URL="https://unknown44.onrender.com/v1/"
-export OPENAI_API_BASE="https://unknown44.onrender.com/v1/"   # older var name, harmless to set both
+export OPENAI_BASE_URL="https://unknown44.onrender.com/v1"
+export OPENAI_API_BASE="https://unknown44.onrender.com/v1"
 
 cat <<EOF > ~/.hermes/config.yaml
 model:
-  provider: custom
-  base_url: https://unknown44.onrender.com/v1/
+  provider: openai
   default: auto
 terminal:
   backend: local
