@@ -32,23 +32,18 @@ if [ -f ~/.config/rclone/rclone.conf ]; then
     rclone sync "$REMOTE_BACKUP" ~/.hermes/ --exclude "cache/**" --exclude "audio_cache/**" --exclude "image_cache/**" --exclude "runtime/**" --drive-chunk-size 8M || echo ">> Restore skipped."
 fi
 
-# 4. Custom endpoint credentials.
-# Hermes reads these standard env var names for a custom/OpenAI-compatible endpoint.
-# There is no "custom" provider you can register via `hermes auth add` -- it's
-# selected through config.yaml (model.provider: custom) below instead.
+# 4. Point Hermes at the wapi round-robin proxy.
+# "auto" tells wapi's smart_router.py to round-robin across ALL of its keys/models
+# for every request -- see AnataVortex7/wapi smart_router.py: is_round_robin check.
 export OPENAI_API_KEY="Swapnpurti@1181"
 export OPENAI_BASE_URL="https://unknown44.onrender.com/v1/"
 export OPENAI_API_BASE="https://unknown44.onrender.com/v1/"   # older var name, harmless to set both
-
-# Confirmed via: curl https://unknown44.onrender.com/v1/models
-# "gemini-pro" does not exist on this endpoint -- closest general chat model is:
-HERMES_MODEL_NAME="gemini-pro-latest"
 
 cat <<EOF > ~/.hermes/config.yaml
 model:
   provider: custom
   base_url: https://unknown44.onrender.com/v1/
-  default: ${HERMES_MODEL_NAME}
+  default: auto
 terminal:
   backend: local
 EOF
