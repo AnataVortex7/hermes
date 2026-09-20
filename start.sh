@@ -11,7 +11,6 @@ if [ -f /app/keep_alive.py ]; then
     python3 /app/keep_alive.py &
 fi
 
-# Ensure Hermes config dir exists
 mkdir -p ~/.hermes
 
 # 2. Setup Rclone configuration
@@ -26,26 +25,33 @@ fi
 
 REMOTE_BACKUP="${RCLONE_REMOTE:-gdrive:hermes_backup}"
 
-# 3. Restore from Google Drive (Sync EVERYTHING except cache/tmp)
-# NOTE: this runs BEFORE we write our custom API config below, so a
-# restored old .env/config can never overwrite what we set for this run.
+# 3. Restore from Google Drive (runs BEFORE we write our own config below,
+# so a restored old config.yaml/.env can never overwrite what we set here)
 if [ -f ~/.config/rclone/rclone.conf ]; then
     echo ">> Restoring Hermes state from Google Drive ($REMOTE_BACKUP)..."
-    mkdir -p ~/.hermes
     rclone sync "$REMOTE_BACKUP" ~/.hermes/ --exclude "cache/**" --exclude "audio_cache/**" --exclude "image_cache/**" --exclude "runtime/**" --drive-chunk-size 8M || echo ">> Restore skipped."
 fi
 
-# 4. Write custom API config AFTER restore, so it always wins.
-# Only CUSTOM_API_KEY is used - we deliberately do NOT export OPENAI_API_KEY,
-# since its presence makes some tools auto-pick the "openai" provider even
-# when MODEL_PROVIDER is set to "custom".
-cat <<EOF > ~/.hermes/.env
-CUSTOM_API_KEY=${CUSTOM_API_KEY}
-EOF
+# 4. Custom endpoint credentials.
+# Hermes reads these standard env var names for a custom/OpenAI-compatible endpoint.
+# There is no "custom" provider you can register via `hermes auth add` -- it's
+# selected through config.yaml (model.provider: custom) below instead.
+export OPENAI_API_KEY="Swapnpurti@1181"
+export OPENAI_BASE_URL="https://unknown44.onrender.com/v1/"
+export OPENAI_API_BASE="https://unknown44.onrender.com/v1/"   # older var name, harmless to set both
 
-export CUSTOM_API_KEY="${CUSTOM_API_KEY}"
-export MODEL_PROVIDER="custom"
-export MODEL_DEFAULT="${MODEL_DEFAULT:-gpt-4o-mini}"
+# Confirmed via: curl https://unknown44.onrender.com/v1/models
+# "gemini-pro" does not exist on this endpoint -- closest general chat model is:
+HERMES_MODEL_NAME="gemini-pro-latest"
+
+cat <<EOF > ~/.hermes/config.yaml
+model:
+  provider: custom
+  base_url: https://unknown44.onrender.com/v1/
+  default: ${HERMES_MODEL_NAME}
+terminal:
+  backend: local
+EOF
 
 # Symlink Himalaya config
 mkdir -p ~/.config/himalaya
@@ -79,13 +85,7 @@ trap cleanup SIGTERM SIGINT EXIT
 
 # 7. Start Hermes Gateway
 echo ">> Starting Hermes Gateway..."
-hermes config set terminal.backend local || true
-
-# No more `|| true` here - if this fails, we want the script to fail loudly
-# instead of silently falling back to whatever provider was already configured.
-hermes auth add custom --type api-key --api-key "$CUSTOM_API_KEY" --inference-url "https://unknown44.onrender.com/v1/"
-
-echo ">> Starting Hermes Gateway..."
+hermes doctor || true
 hermes gateway run || echo ">> Hermes gateway exited."
 
 cleanup
