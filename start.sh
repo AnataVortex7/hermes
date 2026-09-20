@@ -11,8 +11,8 @@ if [ -f /app/keep_alive.py ]; then
 fi
 
 # Set Custom API Endpoint
-# export OPENAI_API_BASE="https://unknown44.onrender.com/v1/"
-# export OPENAI_API_KEY="${OPENAI_API_KEY:-Swapnpurti@1181}"
+export CUSTOM_BASE_URL="https://unknown44.onrender.com/v1/"
+export CUSTOM_API_KEY="${CUSTOM_API_KEY:-Swapnpurti@1181}"
 export MODEL_PROVIDER="custom"
 export MODEL_DEFAULT="gemini-pro"
 export api_key="Swapnpurti@1181"
