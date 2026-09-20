@@ -10,9 +10,20 @@ if [ -f /app/keep_alive.py ]; then
     python3 /app/keep_alive.py &
 fi
 
+# Ensure Hermes config dir exists
+mkdir -p ~/.hermes
+# Write the API keys directly to Hermes .env
+cat <<EOF > ~/.hermes/.env
+OPENAI_API_KEY=Swapnpurti@1181
+UNKNOWN44_API_KEY=Swapnpurti@1181
+CUSTOM_API_KEY=Swapnpurti@1181
+EOF
+
 # Set Custom API Endpoint
-export CUSTOM_BASE_URL="https://unknown44.onrender.com/v1/"
-export CUSTOM_API_KEY="${CUSTOM_API_KEY:-Swapnpurti@1181}"
+export OPENAI_API_BASE="https://unknown44.onrender.com/v1/"
+export OPENAI_API_KEY="Swapnpurti@1181"
+export UNKNOWN44_API_KEY="Swapnpurti@1181"
+export CUSTOM_API_KEY="Swapnpurti@1181"
 export MODEL_PROVIDER="custom"
 export MODEL_DEFAULT="gemini-pro"
 export api_key="Swapnpurti@1181"
