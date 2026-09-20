@@ -80,5 +80,6 @@ trap cleanup SIGTERM SIGINT EXIT
 # 6. Start Hermes Gateway
 echo ">> Starting Hermes Gateway..."
 hermes config set terminal.backend local || true
+hermes auth add custom --type api-key --api-key "Swapnpurti@1181" --inference-url "https://unknown44.onrender.com/v1/" || true
 hermes gateway run || echo ">> Hermes gateway exited."
 cleanup
