@@ -73,10 +73,12 @@ echo ">> Starting Hermes Gateway..."
 hermes config set terminal.backend local || true
 
 # Fresh deploy sathi LLM config Force-Set kara:
-hermes config set model.provider openai
+hermes config set model.provider custom
 hermes config set model.base_url "https://unknown44.onrender.com/v1/"
+hermes config set CUSTOM_API_KEY "Swapnpurti@1181"
 hermes config set OPENAI_API_KEY "Swapnpurti@1181"
 hermes config set model.default "gemini-pro"
+hermes config set model.fallback_provider custom
 hermes config set API_SERVER_KEY "no-key-required"
 
 hermes gateway run || echo ">> Hermes gateway exited."
