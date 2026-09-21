@@ -142,6 +142,35 @@ except: pass
         done
     fi
 
+    # config.yaml patches — warnings fix करण्यासाठी
+    mkdir -p ~/.hermes
+    CONFIG_YAML=~/.hermes/config.yaml
+
+    # SQLite WAL warning fix
+    if [ -f "$CONFIG_YAML" ]; then
+        if ! grep -q "journal_mode" "$CONFIG_YAML"; then
+            echo "" >> "$CONFIG_YAML"
+            echo "database:" >> "$CONFIG_YAML"
+            echo "  journal_mode: wal" >> "$CONFIG_YAML"
+            log "config.yaml: journal_mode: wal added."
+        fi
+        # Model context length fix (falling back to 256k warning)
+        if ! grep -q "context_length" "$CONFIG_YAML"; then
+            echo "" >> "$CONFIG_YAML"
+            echo "model:" >> "$CONFIG_YAML"
+            echo "  context_length: 128000" >> "$CONFIG_YAML"
+            log "config.yaml: context_length: 128000 added."
+        fi
+    else
+        cat > "$CONFIG_YAML" <<YAMLEOF
+database:
+  journal_mode: wal
+model:
+  context_length: 128000
+YAMLEOF
+        log "config.yaml created with defaults."
+    fi
+
     # Himalaya symlink
     mkdir -p ~/.config/himalaya
     if [ -f ~/.hermes/skills/email/himalaya/config.toml ]; then
