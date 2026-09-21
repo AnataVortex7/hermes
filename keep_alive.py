@@ -19,8 +19,6 @@ def get_cpu():
         last_cpu_times[1] = idle
         if diff_total > 0:
             system_cpu = 100.0 * (1.0 - (diff_idle / diff_total))
-            # Koyeb Free Tier allocates 0.1 vCPU (10% of 1 core max). 
-            # So 100% of 0.1 vCPU = 10% system CPU. Scale relative to 0.1 vCPU allocation:
             scaled_cpu = min(100.0, round(system_cpu * 10.0, 1))
             return scaled_cpu
     except Exception:
@@ -28,9 +26,8 @@ def get_cpu():
     return 0.0
 
 def get_stats():
-    # 1. RAM: Koyeb Free Tier fixed at 512 MB limit
     total_mem = 512.0
-    used_mem = 350.0 # fallback
+    used_mem = 350.0
     try:
         with open('/proc/meminfo') as f:
             mem_info = {}
@@ -44,25 +41,20 @@ def get_stats():
             used_mem = round(used_kb / 1024, 1)
     except Exception:
         pass
-    
+
     mem_percent = round((used_mem / total_mem) * 100, 1)
 
-    # 2. DISK: Strict 2000 MB (2 GB) Koyeb Limit
     total_disk_mb = 2000.0
     used_mb = 0.0
     try:
-        # Measure actual data directories
         result = subprocess.check_output(['du', '-sm', '/root', '/app']).decode('utf-8')
         used_mb = sum(int(line.split()[0]) for line in result.splitlines())
     except Exception:
         pass
-    
-    disk_percent = round((used_mb / total_disk_mb) * 100, 1)
 
-    # 3. CPU: 0.1 vCPU limit (scaled)
+    disk_percent = round((used_mb / total_disk_mb) * 100, 1)
     cpu_percent = get_cpu()
 
-    # Load Average
     load_avg = [0.0, 0.0, 0.0]
     try:
         with open('/proc/loadavg') as f:
@@ -70,7 +62,6 @@ def get_stats():
     except Exception:
         pass
 
-    # Uptime
     uptime_str = "0h 0m"
     try:
         with open('/proc/uptime') as f:
@@ -81,7 +72,6 @@ def get_stats():
     except Exception:
         pass
 
-    # Processes
     processes = []
     try:
         ps_out = subprocess.check_output(['ps', '-eo', 'pid,comm,%mem,%cpu', '--sort=-%mem']).decode('utf-8').splitlines()
@@ -133,16 +123,13 @@ HTML_PAGE = """<!DOCTYPE html>
         .status-badge { background-color: #065f46; color: #34d399; padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
         .status-dot { width: 8px; height: 8px; background-color: #34d399; border-radius: 50%; animation: pulse 2s infinite; }
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
-        
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 24px; }
         .card { background-color: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
         .card h2 { font-size: 14px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; display: flex; justify-content: space-between; }
         .value { font-size: 26px; font-weight: 700; color: #f8fafc; margin-bottom: 8px; }
         .subtext { font-size: 13px; color: #64748b; }
-        
         .progress-bar { width: 100%; height: 8px; background-color: #334155; border-radius: 4px; overflow: hidden; margin-top: 12px; }
         .progress-fill { height: 100%; background-color: #38bdf8; transition: width 0.5s ease; border-radius: 4px; }
-        
         .table-card { background-color: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
         .table-card h2 { font-size: 16px; color: #f8fafc; margin-bottom: 16px; }
         table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }
@@ -150,7 +137,6 @@ HTML_PAGE = """<!DOCTYPE html>
         th { color: #94a3b8; font-weight: 600; font-size: 12px; text-transform: uppercase; }
         td { color: #e2e8f0; }
         tr:last-child td { border-bottom: none; }
-        
         footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 12px; }
     </style>
 </head>
@@ -160,7 +146,6 @@ HTML_PAGE = """<!DOCTYPE html>
             <h1>⚡ Hermes Agent Live Stats</h1>
             <div class="status-badge"><span class="status-dot"></span> 0.1 vCPU / 512 MB RAM / 2000 MB Disk</div>
         </header>
-
         <div class="grid">
             <div class="card">
                 <h2>RAM Usage (512 MB) <span id="mem-pct">0%</span></h2>
@@ -168,14 +153,12 @@ HTML_PAGE = """<!DOCTYPE html>
                 <div class="subtext" id="mem-free">Free: 512 MB</div>
                 <div class="progress-bar"><div class="progress-fill" id="mem-bar" style="width: 0%;"></div></div>
             </div>
-
             <div class="card">
                 <h2>Disk Storage (2000 MB) <span id="disk-pct">0%</span></h2>
                 <div class="value" id="disk-val">0 MB / 2000 MB</div>
                 <div class="subtext" id="disk-free">Free: 2000 MB</div>
                 <div class="progress-bar"><div class="progress-fill" id="disk-bar" style="width: 0%; background-color: #34d399;"></div></div>
             </div>
-
             <div class="card">
                 <h2>vCPU Load (0.1 vCPU) <span id="cpu-pct">0%</span></h2>
                 <div class="value" id="cpu-val">0%</div>
@@ -183,7 +166,6 @@ HTML_PAGE = """<!DOCTYPE html>
                 <div class="progress-bar"><div class="progress-fill" id="cpu-bar" style="width: 0%; background-color: #f43f5e;"></div></div>
             </div>
         </div>
-
         <div class="table-card">
             <h2>System Info & Top Processes</h2>
             <div style="margin-bottom: 16px; font-size: 14px; color: #94a3b8;">
@@ -191,49 +173,33 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
             <table>
                 <thead>
-                    <tr>
-                        <th>PID</th>
-                        <th>Command</th>
-                        <th>RAM %</th>
-                        <th>CPU %</th>
-                    </tr>
+                    <tr><th>PID</th><th>Command</th><th>RAM %</th><th>CPU %</th></tr>
                 </thead>
                 <tbody id="proc-table">
                     <tr><td colspan="4" style="text-align: center; color: #64748b;">Loading processes...</td></tr>
                 </tbody>
             </table>
         </div>
-
         <footer>Auto-refreshing every 2 seconds • Koyeb Free Tier Monitoring</footer>
     </div>
-
     <script>
         function updateStats() {
             fetch('/api/stats')
                 .then(res => res.json())
                 .then(data => {
-                    // Memory
                     document.getElementById('mem-val').innerText = `${data.memory.used_mb} MB / 512 MB`;
                     document.getElementById('mem-pct').innerText = `${data.memory.percent}%`;
                     document.getElementById('mem-free').innerText = `Free: ${data.memory.free_mb} MB`;
                     document.getElementById('mem-bar').style.width = `${data.memory.percent}%`;
-
-                    // Disk
                     document.getElementById('disk-val').innerText = `${data.disk.used_mb} MB / 2000 MB`;
                     document.getElementById('disk-pct').innerText = `${data.disk.percent}%`;
                     document.getElementById('disk-free').innerText = `Free: ${data.disk.free_mb} MB`;
                     document.getElementById('disk-bar').style.width = `${data.disk.percent}%`;
-
-                    // CPU
                     document.getElementById('cpu-val').innerText = `${data.cpu.percent}%`;
                     document.getElementById('cpu-pct').innerText = `${data.cpu.percent}%`;
                     document.getElementById('load-avg').innerText = `Load Avg: ${data.cpu.load_avg.join(', ')}`;
                     document.getElementById('cpu-bar').style.width = `${data.cpu.percent}%`;
-
-                    // Uptime
                     document.getElementById('uptime').innerText = data.uptime;
-
-                    // Processes
                     let tbody = document.getElementById('proc-table');
                     tbody.innerHTML = '';
                     data.processes.forEach(p => {
@@ -244,7 +210,6 @@ HTML_PAGE = """<!DOCTYPE html>
                 })
                 .catch(err => console.error('Error fetching stats:', err));
         }
-
         setInterval(updateStats, 2000);
         updateStats();
     </script>
@@ -252,7 +217,20 @@ HTML_PAGE = """<!DOCTYPE html>
 </html>
 """
 
+# Silent routes — हे logs मध्ये दिसणार नाहीत (Koyeb health checks)
+SILENT_ROUTES = {'/', '/api/stats'}
+
 class PingHandler(http.server.BaseHTTPRequestHandler):
+
+    def log_message(self, format, *args):
+        # GET / आणि GET /api/stats — suppress (repetitive health checks)
+        # बाकी सगळं normal log होईल
+        request_line = args[0] if args else ''
+        for route in SILENT_ROUTES:
+            if f'GET {route} ' in request_line or f'HEAD {route} ' in request_line:
+                return
+        super().log_message(format, *args)
+
     def do_GET(self):
         if self.path == '/memory':
             self.send_response(200)
