@@ -75,6 +75,29 @@ clean_partial_files() {
     find ~/.hermes -name "*.partial" -delete 2>/dev/null || true
 }
 
+# Disk मधून फक्त confirmed-safe temporary folders delete करतो
+clean_heavy_dirs() {
+    log "Disk cleanup — safe temporary files delete करतो..."
+
+    # Cache folders — 100% safe, regenerate होतात
+    rm -rf ~/.hermes/cache \
+           ~/.hermes/audio_cache \
+           ~/.hermes/image_cache \
+           ~/.hermes/tmp \
+           ~/.hermes/runtime/tmp 2>/dev/null || true
+
+    # Python bytecode — 100% safe, Python आपोआप परत बनवतो
+    find ~/.hermes -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+    find ~/.hermes -name "*.pyc" -delete 2>/dev/null || true
+
+    # .partial files — corrupt/incomplete files
+    clean_partial_files
+
+    local DISK_USED
+    DISK_USED=$(du -sm ~/.hermes 2>/dev/null | cut -f1)
+    log "Disk cleanup done. ~/.hermes = ${DISK_USED}MB"
+}
+
 # ── RESTORE (फक्त essential files, timeout 60s)
 rclone_restore() {
     if [ "$RCLONE_AVAILABLE" = true ]; then
@@ -146,15 +169,15 @@ except: pass
     mkdir -p ~/.hermes
     CONFIG_YAML=~/.hermes/config.yaml
 
-    # SQLite WAL warning fix
     if [ -f "$CONFIG_YAML" ]; then
+        # SQLite: delete mode stick करायचा (WAL warning बंद होईल)
         if ! grep -q "journal_mode" "$CONFIG_YAML"; then
             echo "" >> "$CONFIG_YAML"
             echo "database:" >> "$CONFIG_YAML"
-            echo "  journal_mode: wal" >> "$CONFIG_YAML"
-            log "config.yaml: journal_mode: wal added."
+            echo "  journal_mode: delete" >> "$CONFIG_YAML"
+            log "config.yaml: journal_mode: delete added."
         fi
-        # Model context length fix (falling back to 256k warning)
+        # Model context length fix
         if ! grep -q "context_length" "$CONFIG_YAML"; then
             echo "" >> "$CONFIG_YAML"
             echo "model:" >> "$CONFIG_YAML"
@@ -164,7 +187,7 @@ except: pass
     else
         cat > "$CONFIG_YAML" <<YAMLEOF
 database:
-  journal_mode: wal
+  journal_mode: delete
 model:
   context_length: 128000
 YAMLEOF
@@ -190,6 +213,7 @@ setup_hermes_auth() {
 
 # ── 5. STARTUP
 rclone_restore
+clean_heavy_dirs   # ← disk वाचवतो — restore नंतर लगेच
 write_hermes_config
 setup_hermes_auth
 
