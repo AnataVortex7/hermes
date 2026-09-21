@@ -44,15 +44,35 @@ fi
 REMOTE_BACKUP="${RCLONE_REMOTE:-gdrive:hermes_backup}"
 
 # 3. Restore from Google Drive
+# --ignore-checksum  : checksum mismatch वर error नाही, file accept करतो
+# --copy-links       : symlinks ला actual file म्हणून copy करतो
+# --ignore-errors    : एखादी file fail झाली तरी पुढे चालू राहतो
 if [ -f ~/.config/rclone/rclone.conf ]; then
     echo ">> Restoring Hermes state from Google Drive ($REMOTE_BACKUP)..."
     mkdir -p ~/.hermes
+
     rclone sync "$REMOTE_BACKUP" ~/.hermes/ \
         --exclude "cache/**" \
         --exclude "audio_cache/**" \
         --exclude "image_cache/**" \
         --exclude "runtime/**" \
-        --drive-chunk-size 8M || echo ">> Restore skipped."
+        --exclude "*.partial" \
+        --ignore-checksum \
+        --copy-links \
+        --ignore-errors \
+        --drive-chunk-size 8M \
+        --transfers 4 \
+        || echo ">> Restore completed with some warnings."
+
+    # Corrupted partial/state files clean करा — fresh start साठी
+    echo ">> Cleaning up corrupted partial/state files..."
+    find ~/.hermes -name "*.partial" -delete 2>/dev/null || true
+    find ~/.hermes/state -name "*.partial" -delete 2>/dev/null || true
+    find ~/.hermes/cron -name "*.partial" -delete 2>/dev/null || true
+
+    echo ">> Restore done."
+else
+    echo ">> No rclone config found, skipping restore."
 fi
 
 # Symlink Himalaya config
@@ -69,7 +89,12 @@ sync_to_cloud() {
             --exclude "audio_cache/**" \
             --exclude "image_cache/**" \
             --exclude "runtime/**" \
-            --drive-chunk-size 8M --fast-list || true
+            --exclude "*.partial" \
+            --ignore-checksum \
+            --copy-links \
+            --ignore-errors \
+            --drive-chunk-size 8M \
+            --fast-list || true
     fi
 }
 
@@ -81,22 +106,16 @@ sync_to_cloud() {
 ) &
 SYNC_PID=$!
 
-# 5. Watchdog — Hermes memory/response check (every 2 minutes)
+# 5. Watchdog — Hermes crash check (every 2 minutes)
 watchdog_check() {
     while true; do
         sleep 120
-
-        # Check if hermes gateway process is still alive
         if ! pgrep -f "hermes gateway" > /dev/null 2>&1; then
-            echo ">> [WATCHDOG] Hermes gateway not found! Will trigger restart..."
-            # Kill any zombie hermes processes
+            echo ">> [WATCHDOG] Hermes gateway not found! Restarting..."
             pkill -f "hermes" 2>/dev/null || true
             sleep 2
-            # Restart hermes gateway in background, main loop will catch it
-            echo ">> [WATCHDOG] Restarting Hermes Gateway..."
             hermes gateway run &
-            HERMES_PID=$!
-            echo ">> [WATCHDOG] Hermes restarted with PID $HERMES_PID"
+            echo ">> [WATCHDOG] Hermes restarted with PID $!"
         else
             echo ">> [WATCHDOG] Hermes is running OK."
         fi
@@ -144,15 +163,13 @@ while true; do
     CRASH_COUNT=$((CRASH_COUNT + 1))
 
     if [ $CRASH_COUNT -ge $MAX_CRASHES ]; then
-        echo ">> [ERROR] Hermes crashed $MAX_CRASHES times. Resetting crash count and waiting 60s..."
+        echo ">> [ERROR] Hermes crashed $MAX_CRASHES times. Waiting 60s before retry..."
         CRASH_COUNT=0
         RESTART_DELAY=60
     fi
 
     echo ">> Restarting in ${RESTART_DELAY} seconds..."
     sleep $RESTART_DELAY
-
-    # Reset delay after successful longer run
     RESTART_DELAY=5
 done
 
