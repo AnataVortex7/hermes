@@ -239,6 +239,29 @@ setup_hermes_auth() {
     log "Hermes auth configured (base: ${FINAL_API_BASE:-$OPENAI_API_BASE})"
 }
 
+# ── TELEGRAM NOTIFICATION
+# Hermes official env vars वापरतो:
+# TELEGRAM_BOT_TOKEN — BotFather कडून मिळालेला token
+# TELEGRAM_ALLOWED_USERS — comma-separated user IDs (तुम्हाला notification जातो)
+# हे दोन्ही Koyeb env मध्ये आधीच set आहेत — नवीन काही लागत नाही
+
+send_telegram() {
+    local MSG="$1"
+
+    # Token नाही — silently skip
+    [ -z "$TELEGRAM_BOT_TOKEN" ] && return 0
+
+    # TELEGRAM_ALLOWED_USERS मधून पहिला user ID घेतो (owner)
+    # Format: "123456789" किंवा "123456789,987654321"
+    local OWNER_ID
+    OWNER_ID=$(echo "$TELEGRAM_ALLOWED_USERS" | cut -d',' -f1 | tr -d ' ')
+    [ -z "$OWNER_ID" ] && return 0
+
+    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        -d "chat_id=${OWNER_ID}&text=${MSG}&parse_mode=HTML" \
+        > /dev/null 2>&1 || true
+}
+
 # ── 4. STARTUP SEQUENCE
 rclone_restore        # Drive असेल तर restore, नाहीतर skip
 clean_junk            # Cache/temp cleanup (restore नंतर)
@@ -285,13 +308,32 @@ log "=========================================="
 # ── 8. AUTO-RESTART LOOP — Hermes crash झाल्यावर restart
 CRASH_COUNT=0
 CONSECUTIVE_FAST_CRASHES=0
+FIRST_START=true
 
 while true; do
     LAST_START=$(date +%s)
     CRASH_COUNT=$((CRASH_COUNT + 1))
     log "Starting Hermes (attempt #$CRASH_COUNT)..."
 
-    hermes gateway run
+    hermes gateway run &
+    HERMES_PID=$!
+
+    # Hermes 5 seconds मध्ये stable झाला तर online notification पाठव
+    sleep 5
+    if kill -0 $HERMES_PID 2>/dev/null; then
+        if [ "$FIRST_START" = "true" ]; then
+            send_telegram "✅ <b>Hermes is online</b>
+🕐 $(date '+%H:%M IST')
+💾 Disk: $(du -sh ~/.hermes 2>/dev/null | cut -f1 || echo '?')
+🔗 Drive: ${DRIVE_OK}"
+            FIRST_START=false
+        else
+            send_telegram "🔄 <b>Hermes restarted</b> (attempt #${CRASH_COUNT})
+🕐 $(date '+%H:%M IST')"
+        fi
+    fi
+
+    wait $HERMES_PID
     EXIT_CODE=$?
 
     UPTIME=$(( $(date +%s) - LAST_START ))
