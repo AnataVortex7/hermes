@@ -5,28 +5,29 @@ export TZ="Asia/Kolkata"
 
 # ============================================================
 # HERMES AUTO-PILOT — Lightweight (512MB RAM / 2GB Disk)
-# फक्त जे लागतं तेच restore/backup — बाकी skip
+# Drive connected असेल तरच backup/restore
+# Cache/temp कधीच backup होत नाही
+# Restart नंतर auto-restore, processes बंद होत नाहीत
 # ============================================================
 
 log() {
-    echo ">> [$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
-# ── 1. KEEP-ALIVE (सगळ्यात आधी)
+# ── 1. KEEP-ALIVE (सगळ्यात आधी — कधीच बंद होणार नाही)
 if [ -f /app/keep_alive.py ]; then
-    log "Keep-alive starting..."
     python3 /app/keep_alive.py &
     KEEPALIVE_PID=$!
+    log "Keep-alive started (PID: $KEEPALIVE_PID)"
 fi
 
-# ── 2. ENVIRONMENT
+# ── 2. ENVIRONMENT CHECK
 if [ -z "$OPENAI_API_KEY" ]; then
-    log "ERROR: OPENAI_API_KEY not set!"
+    log "ERROR: OPENAI_API_KEY not set — exiting."
     wait $KEEPALIVE_PID
     exit 1
 fi
 
-# Core variables — env मधून येतात, hardcoded नाहीत
 export OPENAI_API_BASE="${OPENAI_API_BASE:-https://unknown44.onrender.com/v1/}"
 export UNKNOWN44_API_KEY="${UNKNOWN44_API_KEY:-${OPENAI_API_KEY}}"
 export CUSTOM_API_KEY="${CUSTOM_API_KEY:-${OPENAI_API_KEY}}"
@@ -34,26 +35,43 @@ export MODEL_PROVIDER="${MODEL_PROVIDER:-custom}"
 export MODEL_DEFAULT="${MODEL_DEFAULT:-gemini-pro}"
 export api_key="${OPENAI_API_KEY}"
 
-log "Environment loaded."
+log "Environment ready."
 
 # ── 3. RCLONE SETUP
 mkdir -p ~/.config/rclone ~/.hermes
 
 if [ -n "$RCLONE_CONFIG_BASE64" ]; then
     echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
-    log "Rclone configured from RCLONE_CONFIG_BASE64."
+    log "Rclone config loaded from RCLONE_CONFIG_BASE64."
 elif [ -n "$RCLONE_CONFIG" ]; then
     echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
-    log "Rclone configured from RCLONE_CONFIG."
+    log "Rclone config loaded from RCLONE_CONFIG."
 fi
 
 REMOTE_BACKUP="${RCLONE_REMOTE:-gdrive:hermes_backup}"
-RCLONE_AVAILABLE=false
-[ -f ~/.config/rclone/rclone.conf ] && RCLONE_AVAILABLE=true
 
-# ── फक्त हे folders restore/backup होतील (lightweight)
-# plugins/, node/, bin/, cache/ — SKIP (heavy, disk भरेल)
-ESSENTIAL_INCLUDES=(
+# Drive खरंच connect आहे का ते check करतो — एकदाच
+DRIVE_OK=false
+check_drive() {
+    if [ ! -f ~/.config/rclone/rclone.conf ]; then
+        return 1
+    fi
+    if timeout 15s rclone lsd "$REMOTE_BACKUP" > /dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+if check_drive; then
+    DRIVE_OK=true
+    log "Google Drive connected — backup/restore enabled."
+else
+    log "Google Drive not available — running without backup."
+fi
+
+# ── फक्त हे backup होतील (cache/temp कधीच नाही)
+BACKUP_INCLUDES=(
     "--include=state/**"
     "--include=cron/**"
     "--include=config/**"
@@ -66,72 +84,66 @@ ESSENTIAL_INCLUDES=(
     "--include=.env"
 )
 
-# Env मधून override — नवीन folders add करायचे असतील तर
-# EXTRA_BACKUP_INCLUDES="--include=memory/** --include=logs/**"
+# Env मधून extra folders — EXTRA_BACKUP_INCLUDES="--include=memory/**"
 EXTRA_INCLUDES="${EXTRA_BACKUP_INCLUDES:-}"
 
-# ── CLEANUP
-clean_partial_files() {
-    find ~/.hermes -name "*.partial" -delete 2>/dev/null || true
-}
-
-# Disk मधून फक्त confirmed-safe temporary folders delete करतो
-clean_heavy_dirs() {
-    log "Disk cleanup — safe temporary files delete करतो..."
-
-    # Cache folders — 100% safe, regenerate होतात
+# ── CLEANUP — cache/temp/bytecode delete
+clean_junk() {
     rm -rf ~/.hermes/cache \
            ~/.hermes/audio_cache \
            ~/.hermes/image_cache \
            ~/.hermes/tmp \
            ~/.hermes/runtime/tmp 2>/dev/null || true
-
-    # Python bytecode — 100% safe, Python आपोआप परत बनवतो
     find ~/.hermes -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
     find ~/.hermes -name "*.pyc" -delete 2>/dev/null || true
-
-    # .partial files — corrupt/incomplete files
-    clean_partial_files
-
-    local DISK_USED
-    DISK_USED=$(du -sm ~/.hermes 2>/dev/null | cut -f1)
-    log "Disk cleanup done. ~/.hermes = ${DISK_USED}MB"
+    find ~/.hermes -name "*.partial" -delete 2>/dev/null || true
 }
 
-# ── RESTORE (फक्त essential files, timeout 60s)
+# ── RESTORE — Drive available असेल तरच, एकदाच
 rclone_restore() {
-    if [ "$RCLONE_AVAILABLE" = true ]; then
-        log "Restoring essential files from Google Drive..."
-        timeout 60s rclone copy "$REMOTE_BACKUP" ~/.hermes/ \
-            "${ESSENTIAL_INCLUDES[@]}" \
-            $EXTRA_INCLUDES \
-            --ignore-checksum \
-            --ignore-errors \
-            --transfers 8 \
-            2>&1 | grep -v "NOTICE:" || true
-
-        [ $? -eq 124 ] && log "WARNING: Restore timeout (60s) — continuing anyway."
-        clean_partial_files
-        log "Restore done."
+    if [ "$DRIVE_OK" != "true" ]; then
+        log "Drive not available — restore skipped."
+        return 0
     fi
+
+    log "Restoring from Google Drive..."
+    timeout 90s rclone copy "$REMOTE_BACKUP" ~/.hermes/ \
+        "${BACKUP_INCLUDES[@]}" \
+        $EXTRA_INCLUDES \
+        --ignore-checksum \
+        --ignore-errors \
+        --transfers 8 \
+        2>&1 | grep -E "^(ERROR|CRITICAL)" || true
+
+    local EXIT=$?
+    if [ $EXIT -eq 124 ]; then
+        log "Restore timeout (90s) — continuing with what was downloaded."
+    elif [ $EXIT -ne 0 ]; then
+        log "Restore completed with some errors — continuing."
+    else
+        log "Restore complete."
+    fi
+
+    find ~/.hermes -name "*.partial" -delete 2>/dev/null || true
 }
 
-# ── BACKUP (फक्त essential files)
+# ── BACKUP — Drive available असेल तरच, background मध्ये
 rclone_backup() {
-    if [ "$RCLONE_AVAILABLE" = true ]; then
-        timeout 90s rclone sync ~/.hermes/ "$REMOTE_BACKUP" \
-            "${ESSENTIAL_INCLUDES[@]}" \
-            $EXTRA_INCLUDES \
-            --ignore-checksum \
-            --ignore-errors \
-            --fast-list \
-            2>&1 | grep -v "NOTICE:" || true
+    if [ "$DRIVE_OK" != "true" ]; then
+        return 0
     fi
+
+    timeout 90s rclone sync ~/.hermes/ "$REMOTE_BACKUP" \
+        "${BACKUP_INCLUDES[@]}" \
+        $EXTRA_INCLUDES \
+        --ignore-checksum \
+        --ignore-errors \
+        --fast-list \
+        2>&1 | grep -E "^(ERROR|CRITICAL)" || true
 }
 
-# ── 4. HERMES CONFIG WRITE (env variables मधून — hardcoded नाही)
+# ── HERMES CONFIG
 write_hermes_config() {
-    # .env — env variables मधून येतं
     cat > ~/.hermes/.env <<EOF
 OPENAI_API_KEY=${OPENAI_API_KEY}
 UNKNOWN44_API_KEY=${UNKNOWN44_API_KEY}
@@ -141,16 +153,11 @@ MODEL_PROVIDER=${MODEL_PROVIDER}
 MODEL_DEFAULT=${MODEL_DEFAULT}
 EOF
 
-    # Cron config — env मधून override होतं
-    # HERMES_CRON_SCHEDULE env set केला तर तो वापरेल
+    # Cron schedule override (env मधून)
     if [ -n "$HERMES_CRON_SCHEDULE" ] && [ -d ~/.hermes/cron ]; then
-        log "Cron schedule override: $HERMES_CRON_SCHEDULE"
-        # cron config असेल तर schedule update करा
         find ~/.hermes/cron -name "*.json" | while read f; do
-            # JSON मध्ये schedule field असेल तर override
-            if command -v python3 &>/dev/null; then
-                python3 -c "
-import json, sys
+            python3 -c "
+import json
 try:
     with open('$f') as fp:
         d = json.load(fp)
@@ -158,32 +165,19 @@ try:
         d['schedule'] = '$HERMES_CRON_SCHEDULE'
         with open('$f', 'w') as fp:
             json.dump(d, fp, indent=2)
-        print('Updated schedule in $f')
-except: pass
+except:
+    pass
 " 2>/dev/null || true
-            fi
         done
+        log "Cron schedules updated."
     fi
 
-    # config.yaml patches — warnings fix करण्यासाठी
+    # config.yaml
     mkdir -p ~/.hermes
     CONFIG_YAML=~/.hermes/config.yaml
-
     if [ -f "$CONFIG_YAML" ]; then
-        # SQLite: delete mode stick करायचा (WAL warning बंद होईल)
-        if ! grep -q "journal_mode" "$CONFIG_YAML"; then
-            echo "" >> "$CONFIG_YAML"
-            echo "database:" >> "$CONFIG_YAML"
-            echo "  journal_mode: delete" >> "$CONFIG_YAML"
-            log "config.yaml: journal_mode: delete added."
-        fi
-        # Model context length fix
-        if ! grep -q "context_length" "$CONFIG_YAML"; then
-            echo "" >> "$CONFIG_YAML"
-            echo "model:" >> "$CONFIG_YAML"
-            echo "  context_length: 128000" >> "$CONFIG_YAML"
-            log "config.yaml: context_length: 128000 added."
-        fi
+        grep -q "journal_mode" "$CONFIG_YAML" || printf "\ndatabase:\n  journal_mode: delete\n" >> "$CONFIG_YAML"
+        grep -q "context_length" "$CONFIG_YAML" || printf "\nmodel:\n  context_length: 128000\n" >> "$CONFIG_YAML"
     else
         cat > "$CONFIG_YAML" <<YAMLEOF
 database:
@@ -191,7 +185,6 @@ database:
 model:
   context_length: 128000
 YAMLEOF
-        log "config.yaml created with defaults."
     fi
 
     # Himalaya symlink
@@ -202,22 +195,21 @@ YAMLEOF
 }
 
 setup_hermes_auth() {
-    log "Setting up Hermes auth..."
     hermes config set terminal.backend local 2>/dev/null || true
     hermes auth add custom \
         --type api-key \
         --api-key "${OPENAI_API_KEY}" \
         --inference-url "${OPENAI_API_BASE}" 2>/dev/null || true
-    log "Hermes auth done."
+    log "Hermes auth configured."
 }
 
-# ── 5. STARTUP
-rclone_restore
-clean_heavy_dirs   # ← disk वाचवतो — restore नंतर लगेच
-write_hermes_config
-setup_hermes_auth
+# ── 4. STARTUP SEQUENCE
+rclone_restore        # Drive असेल तर restore, नाहीतर skip
+clean_junk            # Cache/temp cleanup (restore नंतर)
+write_hermes_config   # Config write
+setup_hermes_auth     # Auth setup
 
-# ── 6. BACKGROUND SYNC (दर 1 मिनिट — फक्त essential files)
+# ── 5. BACKGROUND SYNC — दर 60s, Drive असेल तरच, silent
 (
     while true; do
         sleep 60
@@ -225,62 +217,56 @@ setup_hermes_auth
     done
 ) &
 SYNC_PID=$!
-log "Background sync started (PID: $SYNC_PID) — essential files only"
 
-# ── 7. WATCHDOG
+# ── 6. WATCHDOG — Hermes process बंद झाला तर log, restart loop handle करेल
 (
     while true; do
         sleep 120
         if ! pgrep -f "hermes gateway" > /dev/null 2>&1; then
-            log "[WATCHDOG] Hermes missing — restart loop handle करेल."
-        else
-            log "[WATCHDOG] Hermes OK."
+            log "[WATCHDOG] Hermes not running — restart loop will handle."
         fi
     done
 ) &
 WATCHDOG_PID=$!
 
-# ── 8. GRACEFUL SHUTDOWN
+# ── 7. GRACEFUL SHUTDOWN — SIGTERM/SIGINT वर final backup
 cleanup() {
-    log "Shutdown — final backup..."
-    kill $SYNC_PID 2>/dev/null || true
-    kill $WATCHDOG_PID 2>/dev/null || true
+    log "Shutdown signal — final backup..."
+    kill $SYNC_PID $WATCHDOG_PID 2>/dev/null || true
     pkill -f "hermes gateway" 2>/dev/null || true
     rclone_backup
-    log "Done."
+    log "Shutdown complete."
     exit 0
 }
 trap cleanup SIGTERM SIGINT EXIT
 
-# ── 9. AUTO-RESTART LOOP
-CRASH_COUNT=0
-CONSECUTIVE_FAST_CRASHES=0
-
 log "=========================================="
 log "Hermes Auto-Pilot ACTIVE"
-log "Disk usage: $(du -sh ~/.hermes 2>/dev/null | cut -f1) used"
+log "Drive: ${DRIVE_OK} | Remote: ${REMOTE_BACKUP}"
+log "Disk: $(du -sh ~/.hermes 2>/dev/null | cut -f1 || echo '0') used"
 log "=========================================="
+
+# ── 8. AUTO-RESTART LOOP — Hermes crash झाल्यावर restart
+CRASH_COUNT=0
+CONSECUTIVE_FAST_CRASHES=0
 
 while true; do
     LAST_START=$(date +%s)
     CRASH_COUNT=$((CRASH_COUNT + 1))
-    log "Hermes starting... (attempt #$CRASH_COUNT)"
+    log "Starting Hermes (attempt #$CRASH_COUNT)..."
 
     hermes gateway run
     EXIT_CODE=$?
 
     UPTIME=$(( $(date +%s) - LAST_START ))
-    log "Hermes exited (code: $EXIT_CODE, uptime: ${UPTIME}s)"
+    log "Hermes exited (code: $EXIT_CODE, ran for ${UPTIME}s)"
 
     if [ $UPTIME -lt 30 ]; then
         CONSECUTIVE_FAST_CRASHES=$((CONSECUTIVE_FAST_CRASHES + 1))
-        log "Fast crash #$CONSECUTIVE_FAST_CRASHES"
 
         if [ $CONSECUTIVE_FAST_CRASHES -ge 3 ]; then
-            log "3 fast crashes — fresh restore..."
-            pkill -f "hermes" 2>/dev/null || true
-            sleep 2
-            clean_partial_files
+            log "3 fast crashes — re-restoring from Drive..."
+            clean_junk
             rclone_restore
             write_hermes_config
             setup_hermes_auth
@@ -294,5 +280,3 @@ while true; do
         sleep 5
     fi
 done
-
-cleanup
