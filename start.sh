@@ -144,14 +144,50 @@ rclone_backup() {
 
 # ── HERMES CONFIG
 write_hermes_config() {
+    # Drive वरचं .env असेल तर आधी त्यातून values read करा (fallback म्हणून)
+    DRIVE_API_KEY="" DRIVE_API_BASE="" DRIVE_MODEL="" DRIVE_PROVIDER=""
+    if [ -f ~/.hermes/.env ]; then
+        DRIVE_API_KEY=$(grep "^OPENAI_API_KEY=" ~/.hermes/.env | cut -d= -f2- | tr -d '"')
+        DRIVE_API_BASE=$(grep "^OPENAI_API_BASE=" ~/.hermes/.env | cut -d= -f2- | tr -d '"')
+        DRIVE_MODEL=$(grep "^MODEL_DEFAULT=" ~/.hermes/.env | cut -d= -f2- | tr -d '"')
+        DRIVE_PROVIDER=$(grep "^MODEL_PROVIDER=" ~/.hermes/.env | cut -d= -f2- | tr -d '"')
+    fi
+
+    # Env variable असेल → तेच वापर (override)
+    # Env variable नसेल → Drive वरचं वापर (fallback)
+    FINAL_API_KEY="${OPENAI_API_KEY:-$DRIVE_API_KEY}"
+    FINAL_API_BASE="${OPENAI_API_BASE:-$DRIVE_API_BASE}"
+    FINAL_MODEL="${MODEL_DEFAULT:-$DRIVE_MODEL}"
+    FINAL_PROVIDER="${MODEL_PROVIDER:-$DRIVE_PROVIDER}"
+    FINAL_UNKNOWN44="${UNKNOWN44_API_KEY:-$FINAL_API_KEY}"
+    FINAL_CUSTOM="${CUSTOM_API_KEY:-$FINAL_API_KEY}"
+
+    # Log काय वापरतोय ते
+    [ -n "$OPENAI_API_BASE" ] && log "API base: ENV → $FINAL_API_BASE" || log "API base: DRIVE → $FINAL_API_BASE"
+    [ -n "$MODEL_DEFAULT" ]   && log "Model: ENV → $FINAL_MODEL"      || log "Model: DRIVE → $FINAL_MODEL"
+
+    # .env write करा merged values सह
     cat > ~/.hermes/.env <<EOF
-OPENAI_API_KEY=${OPENAI_API_KEY}
-UNKNOWN44_API_KEY=${UNKNOWN44_API_KEY}
-CUSTOM_API_KEY=${CUSTOM_API_KEY}
-OPENAI_API_BASE=${OPENAI_API_BASE}
-MODEL_PROVIDER=${MODEL_PROVIDER}
-MODEL_DEFAULT=${MODEL_DEFAULT}
+OPENAI_API_KEY=${FINAL_API_KEY}
+UNKNOWN44_API_KEY=${FINAL_UNKNOWN44}
+CUSTOM_API_KEY=${FINAL_CUSTOM}
+OPENAI_API_BASE=${FINAL_API_BASE}
+MODEL_PROVIDER=${FINAL_PROVIDER}
+MODEL_DEFAULT=${FINAL_MODEL}
 EOF
+
+    # Runtime exports पण update करा
+    export OPENAI_API_BASE="$FINAL_API_BASE"
+    export MODEL_DEFAULT="$FINAL_MODEL"
+    export MODEL_PROVIDER="$FINAL_PROVIDER"
+    export UNKNOWN44_API_KEY="$FINAL_UNKNOWN44"
+    export CUSTOM_API_KEY="$FINAL_CUSTOM"
+
+    # Backup — env updated असेल तर Drive वर लगेच push करा
+    if [ "$DRIVE_OK" = "true" ]; then
+        rclone_backup
+        log "Config synced to Drive."
+    fi
 
     # Cron schedule override (env मधून)
     if [ -n "$HERMES_CRON_SCHEDULE" ] && [ -d ~/.hermes/cron ]; then
@@ -198,9 +234,9 @@ setup_hermes_auth() {
     hermes config set terminal.backend local 2>/dev/null || true
     hermes auth add custom \
         --type api-key \
-        --api-key "${OPENAI_API_KEY}" \
-        --inference-url "${OPENAI_API_BASE}" 2>/dev/null || true
-    log "Hermes auth configured."
+        --api-key "${FINAL_API_KEY:-$OPENAI_API_KEY}" \
+        --inference-url "${FINAL_API_BASE:-$OPENAI_API_BASE}" 2>/dev/null || true
+    log "Hermes auth configured (base: ${FINAL_API_BASE:-$OPENAI_API_BASE})"
 }
 
 # ── 4. STARTUP SEQUENCE
