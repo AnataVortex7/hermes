@@ -6,7 +6,8 @@ export TZ="Asia/Kolkata"
 # ============================================================
 # HERMES AUTO-PILOT — Lightweight (512MB RAM / 2GB Disk)
 # Drive connected असेल तरच backup/restore
-# Cache/temp कधीच backup होत नाही
+# Server वर जे आहे तेच Drive वर — exact mirror (sync)
+# Cache/tmp कधीच backup होत नाही
 # Restart नंतर auto-restore, processes बंद होत नाहीत
 # ============================================================
 
@@ -49,18 +50,11 @@ elif [ -n "$RCLONE_CONFIG" ]; then
 fi
 
 REMOTE_BACKUP="${RCLONE_REMOTE:-gdrive:hermes_backup}"
-
-# Drive खरंच connect आहे का ते check करतो — एकदाच
 DRIVE_OK=false
+
 check_drive() {
-    if [ ! -f ~/.config/rclone/rclone.conf ]; then
-        return 1
-    fi
-    if timeout 15s rclone lsd "$REMOTE_BACKUP" > /dev/null 2>&1; then
-        return 0
-    else
-        return 1
-    fi
+    [ ! -f ~/.config/rclone/rclone.conf ] && return 1
+    timeout 15s rclone lsd "$REMOTE_BACKUP" > /dev/null 2>&1
 }
 
 if check_drive; then
@@ -70,24 +64,23 @@ else
     log "Google Drive not available — running without backup."
 fi
 
-# ── फक्त हे backup होतील (cache/temp कधीच नाही)
-BACKUP_INCLUDES=(
-    "--include=state/**"
-    "--include=cron/**"
-    "--include=config/**"
-    "--include=auth/**"
-    "--include=skills/email/**"
-    "--include=*.json"
-    "--include=*.toml"
-    "--include=*.yaml"
-    "--include=*.yml"
-    "--include=.env"
+# ── BACKUP/RESTORE EXCLUDES
+# हे कधीच Drive वर जाणार नाही — cache, tmp, bytecode, heavy dirs
+BACKUP_EXCLUDES=(
+    "--exclude=cache/**"
+    "--exclude=audio_cache/**"
+    "--exclude=image_cache/**"
+    "--exclude=tmp/**"
+    "--exclude=runtime/tmp/**"
+    "--exclude=**/__pycache__/**"
+    "--exclude=**.pyc"
+    "--exclude=**.partial"
+    "--exclude=plugins/**"
+    "--exclude=node_modules/**"
 )
+EXTRA_EXCLUDES="${EXTRA_BACKUP_EXCLUDES:-}"
 
-# Env मधून extra folders — EXTRA_BACKUP_INCLUDES="--include=memory/**"
-EXTRA_INCLUDES="${EXTRA_BACKUP_INCLUDES:-}"
-
-# ── CLEANUP — cache/temp/bytecode delete
+# ── CLEANUP — local cache/tmp delete करतो (disk वाचवतो)
 clean_junk() {
     rm -rf ~/.hermes/cache \
            ~/.hermes/audio_cache \
@@ -99,7 +92,7 @@ clean_junk() {
     find ~/.hermes -name "*.partial" -delete 2>/dev/null || true
 }
 
-# ── RESTORE — Drive available असेल तरच, एकदाच
+# ── RESTORE — Drive वरचं सगळं आणतो (excludes सोडून)
 rclone_restore() {
     if [ "$DRIVE_OK" != "true" ]; then
         log "Drive not available — restore skipped."
@@ -107,19 +100,22 @@ rclone_restore() {
     fi
 
     log "Restoring from Google Drive..."
-    timeout 90s rclone copy "$REMOTE_BACKUP" ~/.hermes/ \
-        "${BACKUP_INCLUDES[@]}" \
-        $EXTRA_INCLUDES \
+    local OUTPUT
+    OUTPUT=$(timeout 120s rclone copy "$REMOTE_BACKUP" ~/.hermes/ \
+        "${BACKUP_EXCLUDES[@]}" \
+        $EXTRA_EXCLUDES \
         --ignore-checksum \
         --ignore-errors \
         --transfers 8 \
-        2>&1 | grep -E "^(ERROR|CRITICAL)" || true
+        2>&1)
 
     local EXIT=$?
+    echo "$OUTPUT" | grep -E "^(ERROR|CRITICAL)" || true
+
     if [ $EXIT -eq 124 ]; then
-        log "Restore timeout (90s) — continuing with what was downloaded."
-    elif [ $EXIT -ne 0 ]; then
-        log "Restore completed with some errors — continuing."
+        log "WARNING: Restore timeout — partial restore, continuing."
+    elif echo "$OUTPUT" | grep -q "^ERROR"; then
+        log "WARNING: Restore had errors — continuing with what restored."
     else
         log "Restore complete."
     fi
@@ -127,24 +123,31 @@ rclone_restore() {
     find ~/.hermes -name "*.partial" -delete 2>/dev/null || true
 }
 
-# ── BACKUP — Drive available असेल तरच, background मध्ये
+# ── BACKUP — server वर जे आहे तेच Drive वर (exact mirror)
+# Server वरून delete झालं → Drive वरून पण delete
+# नवीन file → Drive वर जाते
+# Cache/tmp → कधीच जात नाही (exclude)
 rclone_backup() {
     if [ "$DRIVE_OK" != "true" ]; then
         return 0
     fi
 
-    timeout 90s rclone sync ~/.hermes/ "$REMOTE_BACKUP" \
-        "${BACKUP_INCLUDES[@]}" \
-        $EXTRA_INCLUDES \
+    local OUTPUT
+    OUTPUT=$(timeout 90s rclone sync ~/.hermes/ "$REMOTE_BACKUP" \
+        "${BACKUP_EXCLUDES[@]}" \
+        $EXTRA_EXCLUDES \
         --ignore-checksum \
         --ignore-errors \
         --fast-list \
-        2>&1 | grep -E "^(ERROR|CRITICAL)" || true
+        --delete-excluded \
+        2>&1)
+
+    echo "$OUTPUT" | grep -E "^(ERROR|CRITICAL)" || true
 }
 
 # ── HERMES CONFIG
 write_hermes_config() {
-    # Drive वरचं .env असेल तर आधी त्यातून values read करा (fallback म्हणून)
+    # Drive वरचं .env असेल तर आधी त्यातून values read करा (fallback)
     DRIVE_API_KEY="" DRIVE_API_BASE="" DRIVE_MODEL="" DRIVE_PROVIDER=""
     if [ -f ~/.hermes/.env ]; then
         DRIVE_API_KEY=$(grep "^OPENAI_API_KEY=" ~/.hermes/.env | cut -d= -f2- | tr -d '"')
@@ -153,8 +156,7 @@ write_hermes_config() {
         DRIVE_PROVIDER=$(grep "^MODEL_PROVIDER=" ~/.hermes/.env | cut -d= -f2- | tr -d '"')
     fi
 
-    # Env variable असेल → तेच वापर (override)
-    # Env variable नसेल → Drive वरचं वापर (fallback)
+    # Env variable असेल → तेच वापर | नसेल → Drive वरचं वापर
     FINAL_API_KEY="${OPENAI_API_KEY:-$DRIVE_API_KEY}"
     FINAL_API_BASE="${OPENAI_API_BASE:-$DRIVE_API_BASE}"
     FINAL_MODEL="${MODEL_DEFAULT:-$DRIVE_MODEL}"
@@ -162,11 +164,10 @@ write_hermes_config() {
     FINAL_UNKNOWN44="${UNKNOWN44_API_KEY:-$FINAL_API_KEY}"
     FINAL_CUSTOM="${CUSTOM_API_KEY:-$FINAL_API_KEY}"
 
-    # Log काय वापरतोय ते
     [ -n "$OPENAI_API_BASE" ] && log "API base: ENV → $FINAL_API_BASE" || log "API base: DRIVE → $FINAL_API_BASE"
     [ -n "$MODEL_DEFAULT" ]   && log "Model: ENV → $FINAL_MODEL"      || log "Model: DRIVE → $FINAL_MODEL"
 
-    # .env write करा merged values सह
+    # .env write
     cat > ~/.hermes/.env <<EOF
 OPENAI_API_KEY=${FINAL_API_KEY}
 UNKNOWN44_API_KEY=${FINAL_UNKNOWN44}
@@ -176,18 +177,29 @@ MODEL_PROVIDER=${FINAL_PROVIDER}
 MODEL_DEFAULT=${FINAL_MODEL}
 EOF
 
-    # Runtime exports पण update करा
+    # config.yaml मधून OPENAI_BASE_URL conflict fix करतो
+    # Hermes warning: "OPENAI_BASE_URL is set but model.provider is openrouter"
+    # Solution: config.yaml मध्ये provider explicitly set करतो
+    mkdir -p ~/.hermes
+    CONFIG_YAML=~/.hermes/config.yaml
+    if [ -f "$CONFIG_YAML" ]; then
+        grep -q "journal_mode"   "$CONFIG_YAML" || printf "\ndatabase:\n  journal_mode: delete\n"     >> "$CONFIG_YAML"
+        grep -q "context_length" "$CONFIG_YAML" || printf "\nmodel:\n  context_length: 128000\n"      >> "$CONFIG_YAML"
+    else
+        cat > "$CONFIG_YAML" <<YAMLEOF
+database:
+  journal_mode: delete
+model:
+  context_length: 128000
+YAMLEOF
+    fi
+
+    # Runtime exports update
     export OPENAI_API_BASE="$FINAL_API_BASE"
     export MODEL_DEFAULT="$FINAL_MODEL"
     export MODEL_PROVIDER="$FINAL_PROVIDER"
     export UNKNOWN44_API_KEY="$FINAL_UNKNOWN44"
     export CUSTOM_API_KEY="$FINAL_CUSTOM"
-
-    # Backup — env updated असेल तर Drive वर लगेच push करा
-    if [ "$DRIVE_OK" = "true" ]; then
-        rclone_backup
-        log "Config synced to Drive."
-    fi
 
     # Cron schedule override (env मधून)
     if [ -n "$HERMES_CRON_SCHEDULE" ] && [ -d ~/.hermes/cron ]; then
@@ -208,25 +220,16 @@ except:
         log "Cron schedules updated."
     fi
 
-    # config.yaml
-    mkdir -p ~/.hermes
-    CONFIG_YAML=~/.hermes/config.yaml
-    if [ -f "$CONFIG_YAML" ]; then
-        grep -q "journal_mode" "$CONFIG_YAML" || printf "\ndatabase:\n  journal_mode: delete\n" >> "$CONFIG_YAML"
-        grep -q "context_length" "$CONFIG_YAML" || printf "\nmodel:\n  context_length: 128000\n" >> "$CONFIG_YAML"
-    else
-        cat > "$CONFIG_YAML" <<YAMLEOF
-database:
-  journal_mode: delete
-model:
-  context_length: 128000
-YAMLEOF
-    fi
-
     # Himalaya symlink
     mkdir -p ~/.config/himalaya
     if [ -f ~/.hermes/skills/email/himalaya/config.toml ]; then
         ln -sf ~/.hermes/skills/email/himalaya/config.toml ~/.config/himalaya/config.toml
+    fi
+
+    # Drive वर config sync (env updated असेल तर)
+    if [ "$DRIVE_OK" = "true" ]; then
+        rclone_backup
+        log "Config synced to Drive."
     fi
 }
 
@@ -240,35 +243,25 @@ setup_hermes_auth() {
 }
 
 # ── TELEGRAM NOTIFICATION
-# Hermes official env vars वापरतो:
-# TELEGRAM_BOT_TOKEN — BotFather कडून मिळालेला token
-# TELEGRAM_ALLOWED_USERS — comma-separated user IDs (तुम्हाला notification जातो)
-# हे दोन्ही Koyeb env मध्ये आधीच set आहेत — नवीन काही लागत नाही
-
+# TELEGRAM_BOT_TOKEN + TELEGRAM_ALLOWED_USERS — Hermes official env vars
 send_telegram() {
     local MSG="$1"
-
-    # Token नाही — silently skip
     [ -z "$TELEGRAM_BOT_TOKEN" ] && return 0
-
-    # TELEGRAM_ALLOWED_USERS मधून पहिला user ID घेतो (owner)
-    # Format: "123456789" किंवा "123456789,987654321"
     local OWNER_ID
     OWNER_ID=$(echo "$TELEGRAM_ALLOWED_USERS" | cut -d',' -f1 | tr -d ' ')
     [ -z "$OWNER_ID" ] && return 0
-
     curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${OWNER_ID}&text=${MSG}&parse_mode=HTML" \
         > /dev/null 2>&1 || true
 }
 
 # ── 4. STARTUP SEQUENCE
-rclone_restore        # Drive असेल तर restore, नाहीतर skip
-clean_junk            # Cache/temp cleanup (restore नंतर)
-write_hermes_config   # Config write
-setup_hermes_auth     # Auth setup
+rclone_restore      # Drive असेल तर restore, नाहीतर skip
+clean_junk          # Cache/tmp cleanup
+write_hermes_config # Config write + Drive sync
+setup_hermes_auth   # Auth setup
 
-# ── 5. BACKGROUND SYNC — दर 60s, Drive असेल तरच, silent
+# ── 5. BACKGROUND SYNC — दर 60s exact mirror
 (
     while true; do
         sleep 60
@@ -277,7 +270,7 @@ setup_hermes_auth     # Auth setup
 ) &
 SYNC_PID=$!
 
-# ── 6. WATCHDOG — Hermes process बंद झाला तर log, restart loop handle करेल
+# ── 6. WATCHDOG
 (
     while true; do
         sleep 120
@@ -288,9 +281,9 @@ SYNC_PID=$!
 ) &
 WATCHDOG_PID=$!
 
-# ── 7. GRACEFUL SHUTDOWN — SIGTERM/SIGINT वर final backup
+# ── 7. GRACEFUL SHUTDOWN
 cleanup() {
-    log "Shutdown signal — final backup..."
+    log "Shutdown — final backup..."
     kill $SYNC_PID $WATCHDOG_PID 2>/dev/null || true
     pkill -f "hermes gateway" 2>/dev/null || true
     rclone_backup
@@ -305,7 +298,7 @@ log "Drive: ${DRIVE_OK} | Remote: ${REMOTE_BACKUP}"
 log "Disk: $(du -sh ~/.hermes 2>/dev/null | cut -f1 || echo '0') used"
 log "=========================================="
 
-# ── 8. AUTO-RESTART LOOP — Hermes crash झाल्यावर restart
+# ── 8. AUTO-RESTART LOOP
 CRASH_COUNT=0
 CONSECUTIVE_FAST_CRASHES=0
 FIRST_START=true
@@ -318,7 +311,7 @@ while true; do
     hermes gateway run &
     HERMES_PID=$!
 
-    # Hermes 5 seconds मध्ये stable झाला तर online notification पाठव
+    # 5s stable राहिला तर online notification
     sleep 5
     if kill -0 $HERMES_PID 2>/dev/null; then
         if [ "$FIRST_START" = "true" ]; then
