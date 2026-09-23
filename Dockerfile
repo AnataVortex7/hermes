@@ -31,6 +31,15 @@ COPY keep_alive.py /app/keep_alive.py
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
+# Wrapper scripts that shadow apt-get/apt/pip/pip3/npm: they run the real
+# tool as usual, then log any successful `install` into
+# ~/.hermes/installed/*.list so start.sh can reinstall the same
+# packages/tools automatically after a restart (that list rides along with
+# the normal Google Drive backup of ~/.hermes).
+COPY bin/ /app/bin/
+RUN chmod +x /app/bin/*
+ENV PATH="/app/bin:${PATH}"
+
 EXPOSE 10000
 
 CMD ["/app/start.sh"]

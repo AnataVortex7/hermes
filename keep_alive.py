@@ -2,8 +2,18 @@ import http.server
 import json
 import os
 import subprocess
+import time
 
 last_cpu_times = [0, 0]
+
+# The frontend polls /api/stats every 2 seconds, but `du -sm /root /app`
+# (a full recursive scan of everything under ~/.hermes, including your
+# synced skills/sessions) and `ps` are real subprocess spawns -- on a
+# 512MB box, doing that every 2 seconds is needless memory/CPU churn and
+# can contribute to OOM-triggered restarts. Cache the expensive parts and
+# only refresh them every STATS_CACHE_SECONDS.
+STATS_CACHE_SECONDS = int(os.environ.get("STATS_CACHE_SECONDS", "10"))
+_stats_cache = {"time": 0.0, "data": None}
 
 def get_cpu():
     global last_cpu_times
@@ -26,6 +36,16 @@ def get_cpu():
     return 0.0
 
 def get_stats():
+    now = time.time()
+    if _stats_cache["data"] is not None and (now - _stats_cache["time"]) < STATS_CACHE_SECONDS:
+        return _stats_cache["data"]
+    data = _compute_stats()
+    _stats_cache["time"] = now
+    _stats_cache["data"] = data
+    return data
+
+
+def _compute_stats():
     total_mem = 512.0
     used_mem = 350.0
     try:
