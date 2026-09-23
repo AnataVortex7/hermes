@@ -1,0 +1,41 @@
+#!/bin/bash
+# Wrapper: runs the real npm, then (on a successful global `install`) records
+# the package names in ~/.hermes/installed/npm.list so start.sh can replay
+# them on the next boot. Local (non -g) installs aren't tracked -- they live
+# in a project's node_modules, which isn't part of the Hermes backup anyway.
+set -o pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REAL_PATH="$(echo "$PATH" | tr ':' '\n' | grep -vxF "$SELF_DIR" | paste -sd: -)"
+REAL_BIN="$(PATH="$REAL_PATH" command -v npm 2>/dev/null)"
+if [ -z "$REAL_BIN" ]; then
+    echo "npm: no underlying npm binary found on PATH" >&2
+    exit 127
+fi
+
+"$REAL_BIN" "$@"
+rc=$?
+
+if { [ "$1" = "install" ] || [ "$1" = "i" ] || [ "$1" = "add" ]; } && [ $rc -eq 0 ]; then
+    shift
+    IS_GLOBAL=0
+    pkgs=()
+    for a in "$@"; do
+        case "$a" in
+            -g|--global) IS_GLOBAL=1 ;;
+            -*) ;;
+            *) pkgs+=("$a") ;;
+        esac
+    done
+    if [ "$IS_GLOBAL" = "1" ] && [ ${#pkgs[@]} -gt 0 ]; then
+        LOGDIR="$HOME/.hermes/installed"
+        mkdir -p "$LOGDIR"
+        LOGFILE="$LOGDIR/npm.list"
+        touch "$LOGFILE"
+        for p in "${pkgs[@]}"; do
+            grep -qxF "$p" "$LOGFILE" || echo "$p" >> "$LOGFILE"
+        done
+    fi
+fi
+
+exit $rc

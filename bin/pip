@@ -1,0 +1,48 @@
+#!/bin/bash
+# Wrapper: runs the real pip, then (on a successful `install`) records the
+# package names in ~/.hermes/installed/pip.list so start.sh can replay them
+# on the next boot, after that file has been pulled back from Drive.
+set -o pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REAL_PATH="$(echo "$PATH" | tr ':' '\n' | grep -vxF "$SELF_DIR" | paste -sd: -)"
+REAL_BIN="$(PATH="$REAL_PATH" command -v pip 2>/dev/null)"
+if [ -z "$REAL_BIN" ]; then
+    REAL_BIN="$(PATH="$REAL_PATH" command -v pip3 2>/dev/null)"
+fi
+if [ -z "$REAL_BIN" ]; then
+    echo "pip: no underlying pip binary found on PATH" >&2
+    exit 127
+fi
+
+"$REAL_BIN" "$@"
+rc=$?
+
+if [ "$1" = "install" ] && [ $rc -eq 0 ]; then
+    shift
+    HAS_REQ_FILE=0
+    pkgs=()
+    for a in "$@"; do
+        case "$a" in
+            -r|--requirement|--requirement=*)
+                HAS_REQ_FILE=1
+                ;;
+            -*) ;;
+            *) pkgs+=("$a") ;;
+        esac
+    done
+    if [ "$HAS_REQ_FILE" = "1" ]; then
+        echo "⚠️  [pip wrapper] '-r/--requirement' installs aren't auto-persisted across restarts -- add the packages to ~/.hermes/installed/pip.list yourself if you need them to survive." >&2
+    fi
+    if [ ${#pkgs[@]} -gt 0 ]; then
+        LOGDIR="$HOME/.hermes/installed"
+        mkdir -p "$LOGDIR"
+        LOGFILE="$LOGDIR/pip.list"
+        touch "$LOGFILE"
+        for p in "${pkgs[@]}"; do
+            grep -qxF "$p" "$LOGFILE" || echo "$p" >> "$LOGFILE"
+        done
+    fi
+fi
+
+exit $rc
