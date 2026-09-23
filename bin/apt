@@ -1,0 +1,43 @@
+#!/bin/bash
+# Wrapper: runs the real apt-get, then (on a successful `install`) records
+# the package names in ~/.hermes/installed/apt.list so start.sh can replay
+# them (with a fresh `apt-get update`) on the next boot.
+set -o pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REAL_PATH="$(echo "$PATH" | tr ':' '\n' | grep -vxF "$SELF_DIR" | paste -sd: -)"
+REAL_BIN="$(PATH="$REAL_PATH" command -v apt-get 2>/dev/null)"
+if [ -z "$REAL_BIN" ]; then
+    echo "apt-get: no underlying apt-get binary found on PATH" >&2
+    exit 127
+fi
+
+"$REAL_BIN" "$@"
+rc=$?
+
+HAS_INSTALL=0
+for a in "$@"; do
+    [ "$a" = "install" ] && HAS_INSTALL=1
+done
+
+if [ "$HAS_INSTALL" = "1" ] && [ $rc -eq 0 ]; then
+    pkgs=()
+    for a in "$@"; do
+        case "$a" in
+            install) ;;
+            -*) ;;
+            *) pkgs+=("$a") ;;
+        esac
+    done
+    if [ ${#pkgs[@]} -gt 0 ]; then
+        LOGDIR="$HOME/.hermes/installed"
+        mkdir -p "$LOGDIR"
+        LOGFILE="$LOGDIR/apt.list"
+        touch "$LOGFILE"
+        for p in "${pkgs[@]}"; do
+            grep -qxF "$p" "$LOGFILE" || echo "$p" >> "$LOGFILE"
+        done
+    fi
+fi
+
+exit $rc
