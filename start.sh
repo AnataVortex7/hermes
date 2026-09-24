@@ -13,21 +13,12 @@ fi
 # Ensure Hermes config dir exists
 mkdir -p ~/.hermes
 
-# Write the API keys directly to Hermes .env
+# Write the API keys from env vars to Hermes .env
 cat <<ENVEOF > ~/.hermes/.env
-OPENAI_API_KEY=Swapnpurti@1181
-UNKNOWN44_API_KEY=Swapnpurti@1181
-CUSTOM_API_KEY=Swapnpurti@1181
+OPENAI_API_KEY=${CUSTOM_API_KEY}
+UNKNOWN44_API_KEY=${CUSTOM_API_KEY}
+CUSTOM_API_KEY=${CUSTOM_API_KEY}
 ENVEOF
-
-# Set Custom API Endpoint
-export OPENAI_API_BASE="https://unknown44.onrender.com/v1/"
-export OPENAI_API_KEY="Swapnpurti@1181"
-export UNKNOWN44_API_KEY="Swapnpurti@1181"
-export CUSTOM_API_KEY="Swapnpurti@1181"
-export MODEL_PROVIDER="custom"
-export MODEL_DEFAULT="gemini-pro"
-export api_key="Swapnpurti@1181"
 
 # 2. Setup Rclone configuration
 mkdir -p ~/.config/rclone
@@ -45,13 +36,23 @@ REMOTE_BACKUP="${RCLONE_REMOTE:-gdrive:hermes_backup}"
 if [ -f ~/.config/rclone/rclone.conf ]; then
   echo ">> Restoring Hermes state from Google Drive ($REMOTE_BACKUP)..."
   mkdir -p ~/.hermes
-  rclone sync "$REMOTE_BACKUP" ~/.hermes/ --exclude "cache/**" --exclude "audio_cache/**" --exclude "image_cache/**" --exclude "runtime/**" --drive-chunk-size 8M || echo ">> Restore skipped."
+  rclone sync "$REMOTE_BACKUP" ~/.hermes/ \
+    --exclude "cache/**" \
+    --exclude "audio_cache/**" \
+    --exclude "image_cache/**" \
+    --exclude "runtime/**" \
+    --drive-chunk-size 8M || echo ">> Restore skipped."
 fi
 
 # Symlink Himalaya config
 mkdir -p ~/.config/himalaya
 if [ -f ~/.hermes/skills/email/himalaya/config.toml ]; then
   ln -sf ~/.hermes/skills/email/himalaya/config.toml ~/.config/himalaya/config.toml
+fi
+
+# Fix script permissions after restore
+if [ -d ~/.hermes/scripts ]; then
+  chmod +x ~/.hermes/scripts/*.sh 2>/dev/null || true
 fi
 
 # 4. STARTUP NOTIFICATION — Drive restore nantar, gateway start honyapurvi
@@ -73,7 +74,12 @@ fi
 # 5. Background Sync Loop (Every 1 Minute)
 sync_to_cloud() {
   if [ -f ~/.config/rclone/rclone.conf ]; then
-    rclone sync ~/.hermes/ "$REMOTE_BACKUP" --exclude "cache/**" --exclude "audio_cache/**" --exclude "image_cache/**" --exclude "runtime/**" --drive-chunk-size 8M --fast-list || true
+    rclone sync ~/.hermes/ "$REMOTE_BACKUP" \
+      --exclude "cache/**" \
+      --exclude "audio_cache/**" \
+      --exclude "image_cache/**" \
+      --exclude "runtime/**" \
+      --drive-chunk-size 8M --fast-list || true
   fi
 }
 
@@ -97,7 +103,10 @@ trap cleanup SIGTERM SIGINT EXIT
 # 7. Start Hermes Gateway
 echo ">> Starting Hermes Gateway..."
 hermes config set terminal.backend local || true
-hermes auth add custom --type api-key --api-key "Swapnpurti@1181" --inference-url "https://unknown44.onrender.com/v1/" || true
+hermes auth add custom \
+  --type api-key \
+  --api-key "${CUSTOM_API_KEY}" \
+  --inference-url "${CUSTOM_API_BASE_URL}" || true
 hermes gateway run || echo ">> Hermes gateway exited."
 
 cleanup
