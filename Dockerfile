@@ -29,7 +29,8 @@ WORKDIR /app
 # Copy our custom scripts
 COPY keep_alive.py /app/keep_alive.py
 COPY start.sh /app/start.sh
-RUN chmod +x /app/start.sh
+COPY watchdog.sh /app/watchdog.sh
+RUN chmod +x /app/start.sh /app/watchdog.sh
 
 # Wrapper scripts that shadow apt-get/apt/pip/pip3/npm: they run the real
 # tool as usual, then log any successful `install` into

@@ -3,17 +3,27 @@ import json
 import os
 import subprocess
 import time
+import threading
 
 last_cpu_times = [0, 0]
 
-# The frontend polls /api/stats every 2 seconds, but `du -sm /root /app`
-# (a full recursive scan of everything under ~/.hermes, including your
-# synced skills/sessions) and `ps` are real subprocess spawns -- on a
-# 512MB box, doing that every 2 seconds is needless memory/CPU churn and
-# can contribute to OOM-triggered restarts. Cache the expensive parts and
-# only refresh them every STATS_CACHE_SECONDS.
 STATS_CACHE_SECONDS = int(os.environ.get("STATS_CACHE_SECONDS", "10"))
 _stats_cache = {"time": 0.0, "data": None}
+
+# ── Startup state — gateway ला signal करायला वापरतो ──
+# "waiting"  : Drive restore अजून चालू आहे
+# "ready"    : Restore झालं, gateway restart झालं
+_startup_state = {"phase": "waiting", "message": "Restoring state from Google Drive..."}
+_startup_lock = threading.Lock()
+
+def set_startup_ready():
+    with _startup_lock:
+        _startup_state["phase"] = "ready"
+        _startup_state["message"] = "Hermes is fully operational."
+
+def get_startup_phase():
+    with _startup_lock:
+        return _startup_state.copy()
 
 def get_cpu():
     global last_cpu_times
@@ -28,9 +38,7 @@ def get_cpu():
         last_cpu_times[0] = total
         last_cpu_times[1] = idle
         if diff_total > 0:
-            system_cpu = 100.0 * (1.0 - (diff_idle / diff_total))
-            scaled_cpu = min(100.0, round(system_cpu * 10.0, 1))
-            return scaled_cpu
+            return min(100.0, round(100.0 * (1.0 - (diff_idle / diff_total)) * 10.0, 1))
     except Exception:
         pass
     return 0.0
@@ -43,7 +51,6 @@ def get_stats():
     _stats_cache["time"] = now
     _stats_cache["data"] = data
     return data
-
 
 def _compute_stats():
     total_mem = 512.0
@@ -63,7 +70,6 @@ def _compute_stats():
         pass
 
     mem_percent = round((used_mem / total_mem) * 100, 1)
-
     total_disk_mb = 2000.0
     used_mb = 0.0
     try:
@@ -98,35 +104,44 @@ def _compute_stats():
         for line in ps_out[1:8]:
             parts = line.split()
             if len(parts) >= 4:
-                processes.append({
-                    'pid': parts[0],
-                    'command': parts[1],
-                    'mem': parts[2],
-                    'cpu': parts[3]
-                })
+                processes.append({'pid': parts[0], 'command': parts[1], 'mem': parts[2], 'cpu': parts[3]})
     except Exception:
         pass
 
+    phase_info = get_startup_phase()
+
     return {
-        "memory": {
-            "total_mb": 512,
-            "used_mb": used_mem,
-            "free_mb": max(0, round(512 - used_mem, 1)),
-            "percent": min(100.0, mem_percent)
-        },
-        "disk": {
-            "total_mb": 2000,
-            "used_mb": used_mb,
-            "free_mb": max(0, round(2000 - used_mb, 1)),
-            "percent": min(100.0, disk_percent)
-        },
-        "cpu": {
-            "percent": cpu_percent,
-            "load_avg": load_avg
-        },
+        "memory": {"total_mb": 512, "used_mb": used_mem, "free_mb": max(0, round(512 - used_mem, 1)), "percent": min(100.0, mem_percent)},
+        "disk": {"total_mb": 2000, "used_mb": used_mb, "free_mb": max(0, round(2000 - used_mb, 1)), "percent": min(100.0, disk_percent)},
+        "cpu": {"percent": cpu_percent, "load_avg": load_avg},
         "uptime": uptime_str,
-        "processes": processes
+        "processes": processes,
+        "startup": phase_info
     }
+
+# ── Startup banner — /memory page वर दाखवतो ──
+STARTUP_BANNER = """
+<div id="startup-banner" style="
+    background: linear-gradient(135deg, #1e3a5f, #0f2744);
+    border: 1px solid #38bdf8;
+    border-radius: 12px;
+    padding: 20px 24px;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+">
+  <div style="font-size: 32px;">⏳</div>
+  <div>
+    <div style="color: #38bdf8; font-weight: 700; font-size: 16px;" id="banner-title">
+      Restoring from Google Drive...
+    </div>
+    <div style="color: #94a3b8; font-size: 13px; margin-top: 4px;" id="banner-sub">
+      Hermes history, skills, and state are being restored. Gateway will start automatically once ready.
+    </div>
+  </div>
+</div>
+"""
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -144,7 +159,7 @@ HTML_PAGE = """<!DOCTYPE html>
         .status-dot { width: 8px; height: 8px; background-color: #34d399; border-radius: 50%; animation: pulse 2s infinite; }
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 24px; }
-        .card { background-color: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+        .card { background-color: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
         .card h2 { font-size: 14px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; display: flex; justify-content: space-between; }
         .value { font-size: 26px; font-weight: 700; color: #f8fafc; margin-bottom: 8px; }
         .subtext { font-size: 13px; color: #64748b; }
@@ -158,6 +173,8 @@ HTML_PAGE = """<!DOCTYPE html>
         td { color: #e2e8f0; }
         tr:last-child td { border-bottom: none; }
         footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 12px; }
+        #startup-banner { transition: opacity 0.5s; }
+        #startup-banner.hidden { opacity: 0; pointer-events: none; }
     </style>
 </head>
 <body>
@@ -166,6 +183,9 @@ HTML_PAGE = """<!DOCTYPE html>
             <h1>⚡ Hermes Agent Live Stats</h1>
             <div class="status-badge"><span class="status-dot"></span> 0.1 vCPU / 512 MB RAM / 2000 MB Disk</div>
         </header>
+
+        """ + STARTUP_BANNER + """
+
         <div class="grid">
             <div class="card">
                 <h2>RAM Usage (512 MB) <span id="mem-pct">0%</span></h2>
@@ -192,11 +212,9 @@ HTML_PAGE = """<!DOCTYPE html>
                 System Uptime: <strong id="uptime" style="color: #f8fafc;">...</strong>
             </div>
             <table>
-                <thead>
-                    <tr><th>PID</th><th>Command</th><th>RAM %</th><th>CPU %</th></tr>
-                </thead>
+                <thead><tr><th>PID</th><th>Command</th><th>RAM %</th><th>CPU %</th></tr></thead>
                 <tbody id="proc-table">
-                    <tr><td colspan="4" style="text-align: center; color: #64748b;">Loading processes...</td></tr>
+                    <tr><td colspan="4" style="text-align: center; color: #64748b;">Loading...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -207,28 +225,38 @@ HTML_PAGE = """<!DOCTYPE html>
             fetch('/api/stats')
                 .then(res => res.json())
                 .then(data => {
-                    document.getElementById('mem-val').innerText = `${data.memory.used_mb} MB / 512 MB`;
-                    document.getElementById('mem-pct').innerText = `${data.memory.percent}%`;
-                    document.getElementById('mem-free').innerText = `Free: ${data.memory.free_mb} MB`;
-                    document.getElementById('mem-bar').style.width = `${data.memory.percent}%`;
-                    document.getElementById('disk-val').innerText = `${data.disk.used_mb} MB / 2000 MB`;
-                    document.getElementById('disk-pct').innerText = `${data.disk.percent}%`;
-                    document.getElementById('disk-free').innerText = `Free: ${data.disk.free_mb} MB`;
-                    document.getElementById('disk-bar').style.width = `${data.disk.percent}%`;
-                    document.getElementById('cpu-val').innerText = `${data.cpu.percent}%`;
-                    document.getElementById('cpu-pct').innerText = `${data.cpu.percent}%`;
-                    document.getElementById('load-avg').innerText = `Load Avg: ${data.cpu.load_avg.join(', ')}`;
-                    document.getElementById('cpu-bar').style.width = `${data.cpu.percent}%`;
+                    document.getElementById('mem-val').innerText = data.memory.used_mb + ' MB / 512 MB';
+                    document.getElementById('mem-pct').innerText = data.memory.percent + '%';
+                    document.getElementById('mem-free').innerText = 'Free: ' + data.memory.free_mb + ' MB';
+                    document.getElementById('mem-bar').style.width = data.memory.percent + '%';
+                    document.getElementById('disk-val').innerText = data.disk.used_mb + ' MB / 2000 MB';
+                    document.getElementById('disk-pct').innerText = data.disk.percent + '%';
+                    document.getElementById('disk-free').innerText = 'Free: ' + data.disk.free_mb + ' MB';
+                    document.getElementById('disk-bar').style.width = data.disk.percent + '%';
+                    document.getElementById('cpu-val').innerText = data.cpu.percent + '%';
+                    document.getElementById('cpu-pct').innerText = data.cpu.percent + '%';
+                    document.getElementById('load-avg').innerText = 'Load Avg: ' + data.cpu.load_avg.join(', ');
+                    document.getElementById('cpu-bar').style.width = data.cpu.percent + '%';
                     document.getElementById('uptime').innerText = data.uptime;
-                    let tbody = document.getElementById('proc-table');
+
+                    // Startup banner update
+                    if (data.startup && data.startup.phase === 'ready') {
+                        var banner = document.getElementById('startup-banner');
+                        if (banner) banner.classList.add('hidden');
+                    } else if (data.startup) {
+                        var title = document.getElementById('banner-title');
+                        if (title) title.innerText = data.startup.message || 'Restoring...';
+                    }
+
+                    var tbody = document.getElementById('proc-table');
                     tbody.innerHTML = '';
-                    data.processes.forEach(p => {
-                        let tr = document.createElement('tr');
-                        tr.innerHTML = `<td>${p.pid}</td><td>${p.command}</td><td>${p.mem}%</td><td>${p.cpu}%</td>`;
+                    data.processes.forEach(function(p) {
+                        var tr = document.createElement('tr');
+                        tr.innerHTML = '<td>' + p.pid + '</td><td>' + p.command + '</td><td>' + p.mem + '%</td><td>' + p.cpu + '%</td>';
                         tbody.appendChild(tr);
                     });
                 })
-                .catch(err => console.error('Error fetching stats:', err));
+                .catch(function(err) { console.error('Stats fetch error:', err); });
         }
         setInterval(updateStats, 2000);
         updateStats();
@@ -237,14 +265,10 @@ HTML_PAGE = """<!DOCTYPE html>
 </html>
 """
 
-# Silent routes — हे logs मध्ये दिसणार नाहीत (Koyeb health checks)
 SILENT_ROUTES = {'/', '/api/stats'}
 
 class PingHandler(http.server.BaseHTTPRequestHandler):
-
     def log_message(self, format, *args):
-        # GET / आणि GET /api/stats — suppress (repetitive health checks)
-        # बाकी सगळं normal log होईल
         request_line = args[0] if args else ''
         for route in SILENT_ROUTES:
             if f'GET {route} ' in request_line or f'HEAD {route} ' in request_line:
@@ -261,8 +285,14 @@ class PingHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            stats = get_stats()
-            self.wfile.write(json.dumps(stats).encode('utf-8'))
+            self.wfile.write(json.dumps(get_stats()).encode('utf-8'))
+        elif self.path == '/startup-ready':
+            # start.sh हा endpoint call करतो जेव्हा restore पूर्ण होतो
+            set_startup_ready()
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"OK")
         else:
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
