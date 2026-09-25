@@ -71,6 +71,10 @@ if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$FIRST_USER" ]; then
   echo ">> Notification sent."
 fi
 
+# Signal keep-alive server that startup is complete (removes /memory banner)
+echo ">> Signaling startup complete..."
+curl -s "http://localhost:${PORT:-10000}/startup-ready" || true
+
 # 5. Background Sync Loop (Every 1 Minute)
 sync_to_cloud() {
   if [ -f ~/.config/rclone/rclone.conf ]; then
