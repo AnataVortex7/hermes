@@ -24,7 +24,7 @@ fi
 
 REMOTE_BACKUP="${RCLONE_REMOTE:-gdrive:hermes_backup}"
 
-# rclone_sync — bash array नाही (sh compatible), excludes function मध्ये hardcode
+# rclone_sync — bash arrays नाहीत (sh compatible), excludes function मध्ये hardcode
 rclone_sync() {
   rclone "$@" \
     --exclude "cache/**" \
@@ -74,47 +74,86 @@ RESOLVED_MODEL="${HERMES_MODEL:-${LLM_MODEL:-${MODEL_DEFAULT:-}}}"
   [ -n "$SLACK_ALLOWED_USERS" ]        && echo "SLACK_ALLOWED_USERS=${SLACK_ALLOWED_USERS}"
 } > ~/.hermes/.env
 
-# 5. Patch config.yaml using PyYAML
-# Regex approach: config.yaml मध्ये model: nested block असतो (model.default, model.provider
-# इत्यादी sub-keys). Regex ने काही sub-keys miss होतात → YAML syntax error.
-# PyYAML fix: YAML parse करतो → model: auto set करतो → valid YAML dump करतो.
-# Structure काहीही असो (nested dict, scalar, per_platform) — सगळं handle होतं.
-python3 - << 'PYEOF'
-import os, sys
-try:
-    import yaml
-except ImportError:
-    print("PyYAML not found, skipping config patch")
-    sys.exit(0)
+# 5. Patch config.yaml
+#
+# Problems:
+# A) System python3 ला PyYAML नाही → Hermes चा स्वतःचा Python वापरतो
+#    (Hermes Python: /root/.hermes/tools/python-*/bin/python3 — yaml built-in)
+# B) Drive मध्ये corrupt config.yaml आहे (जुन्या patches नंतर sync झाला):
+#    "model: auto\n  provider: 'auto'\n  per_platform: ..." — scalar + orphaned sub-keys
+#    Fix: आधी regex ने corruption clean करतो, मग yaml ने parse + patch
+
+# Hermes Python शोधतो (yaml available असतो)
+HERMES_PY=$(ls /root/.hermes/tools/python-*/bin/python3 2>/dev/null | sort -V | tail -1)
+PATCH_PY="${HERMES_PY:-python3}"
+echo ">> Config patch using: $PATCH_PY"
+
+"$PATCH_PY" - << 'PYEOF'
+import os, re, sys
 
 cfg_path = os.path.expanduser("~/.hermes/config.yaml")
 if not os.path.exists(cfg_path):
     print("config.yaml not found, skipping patch")
     sys.exit(0)
 
+content = open(cfg_path).read()
+
+# --- STEP 1: Pre-fix corruption ---
+# Drive मधून restore होणारा corrupt config असा दिसतो:
+#   model: auto          <- scalar value (मागच्या patch ने set केला)
+#     provider: "auto"   <- orphaned indented sub-key (yaml invalid)
+#     per_platform: ...
+# Fix: "model: <scalar>\n  <indented lines>" → "model: <scalar>\n"
+content = re.sub(
+    r'^(model\s*:[^\n\S]*\S[^\n]*)\n((?:[ \t]+[^\n]*\n)*)',
+    lambda m: m.group(1) + '\n',
+    content,
+    flags=re.MULTILINE
+)
+
+# --- STEP 2: YAML parse + patch ---
 try:
-    content = open(cfg_path).read()
+    import yaml
+
     cfg = yaml.safe_load(content)
 
     if not isinstance(cfg, dict):
-        print("config.yaml unexpected format, skipping patch")
-        sys.exit(0)
+        print("config.yaml unexpected format, using regex fallback")
+        raise ValueError("not a dict")
 
-    # model → auto (nested dict असो किंवा scalar, दोन्ही replace होतात)
+    # model → auto (nested dict असो किंवा scalar)
     cfg["model"] = "auto"
 
     # language → en
-    if "ui" not in cfg or not isinstance(cfg.get("ui"), dict):
+    if not isinstance(cfg.get("ui"), dict):
         cfg["ui"] = {}
     cfg["ui"]["language"] = "en"
 
     open(cfg_path, "w").write(
         yaml.dump(cfg, default_flow_style=False, allow_unicode=True, sort_keys=False)
     )
-    print("config.yaml patched: model=auto, language=en")
+    print("config.yaml patched via yaml: model=auto, language=en")
 
 except Exception as e:
-    print("config.yaml patch failed: " + str(e))
+    # Fallback: yaml failed (still corrupt or no yaml module)
+    # Step 1 ने corruption already clean केली, आता regex ने model + language patch
+
+    # language
+    if re.search(r'^ui\s*:', content, re.MULTILINE):
+        content = re.sub(r'(language\s*:)\s*\S+', r'\1 en', content)
+    elif 'language:' in content:
+        content = re.sub(r'language:\s*\S+', 'language: en', content)
+    else:
+        content += '\nui:\n  language: en\n'
+
+    # model (corruption already removed in step 1, just ensure value is auto)
+    if re.search(r'^model\s*:', content, re.MULTILINE):
+        content = re.sub(r'^model\s*:[^\n]*', 'model: auto', content, flags=re.MULTILINE)
+    else:
+        content += '\nmodel: auto\n'
+
+    open(cfg_path, "w").write(content)
+    print("config.yaml patched via regex fallback (yaml error: " + str(e) + ")")
 PYEOF
 
 # Symlink Himalaya config
