@@ -25,6 +25,12 @@ fi
 REMOTE_BACKUP="${RCLONE_REMOTE:-gdrive:hermes_backup}"
 
 # rclone_sync — bash arrays नाहीत (sh compatible), excludes function मध्ये hardcode
+# NOTE: "tools/**" आणि "installs/**" आधी इथे exclude होते, पण त्यामुळे प्रत्येक
+# restart ला per-platform dependency installs (उदा. Telegram चं pm/sync_venv
+# install) पूर्ण पुसली जायची — installer कधीच पूर्ण होण्याआधी event-loop
+# liveness-watchdog मुळे gateway क्रॅश व्हायचा, आणि पुढच्या restart ला परत
+# शून्यापासून तोच race. आता हे दोन्ही sync मध्ये ठेवतो जेणेकरून जेवढी install
+# प्रगती होईल ती टिकून राहील.
 rclone_sync() {
   rclone "$@" \
     --exclude "cache/**" \
@@ -32,8 +38,6 @@ rclone_sync() {
     --exclude "image_cache/**" \
     --exclude "runtime/**" \
     --exclude "hermes-agent/**" \
-    --exclude "tools/**" \
-    --exclude "installs/**" \
     --exclude "node_modules/**" \
     --exclude ".env"
 }
@@ -150,10 +154,22 @@ try:
         cfg["ui"] = {}
     cfg["ui"]["language"] = "en"
 
+    # ── Koyeb free tier फक्त 512MB / 0.1vCPU देतो, Hermes ला recommended 4-8GB
+    # लागतो. न वापरलेले messaging platforms (feishu वगैरे) load होताना
+    # timeout/crash होऊन संपूर्ण container OOM/crash करू शकतात — म्हणून ते
+    # explicitly disable करतो, जेणेकरून load होण्याचा प्रयत्नच होणार नाही.
+    DISABLED_PLATFORMS = ["feishu", "dingtalk", "wecom", "weixin", "qq", "line", "bluebubbles", "matrix", "signal", "sms", "mattermost", "home_assistant", "ntfy", "yuanbao", "teams", "whatsapp"]
+    if not isinstance(cfg.get("platforms"), dict):
+        cfg["platforms"] = {}
+    for _p in DISABLED_PLATFORMS:
+        if not isinstance(cfg["platforms"].get(_p), dict):
+            cfg["platforms"][_p] = {}
+        cfg["platforms"][_p]["enabled"] = False
+
     open(cfg_path, "w").write(
         yaml.dump(cfg, default_flow_style=False, allow_unicode=True, sort_keys=False)
     )
-    print("config.yaml patched via yaml: model rebuilt from env, language=en")
+    print("config.yaml patched via yaml: model rebuilt from env, language=en, unused platforms disabled")
 
 except Exception as e:
     # yaml module नाही किंवा वेगळीच corruption सापडली — regex fallback (फक्त language)
