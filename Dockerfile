@@ -8,6 +8,20 @@ RUN apt-get update && apt-get install -y curl git sudo bash unzip libatomic1 && 
 # Install Hermes Agent
 RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 
+# ── FIX: Hermes च्या bundled python मध्ये PyYAML install कर ──
+# start.sh मधला config.yaml patch script याच python ने चालतो. yaml module
+# नसेल तर तो नेहमी crude regex fallback वर जातो, जो nested corruption
+# (उदा. "model: auto" खाली orphaned "provider:" key) पूर्ण साफ करत नाही —
+# त्यामुळेच "expected <block end>, but found '<block mapping start>'" error
+# आणि Telegram adapter creation fail होत राहतं. यामुळे real yaml parse+patch
+# path चालेल.
+RUN HERMES_PY=$(ls /root/.hermes/tools/python-*/bin/python3 2>/dev/null | sort -V | tail -1) && \
+    if [ -n "$HERMES_PY" ]; then \
+        "$HERMES_PY" -m pip install --no-cache-dir pyyaml; \
+    else \
+        echo "WARNING: Hermes bundled python not found, pyyaml not installed"; \
+    fi
+
 # Build time cleanup — disk वाचवण्यासाठी (Koyeb 2GB limit)
 RUN set -e && \
     rm -rf /root/.hermes/cache \
