@@ -4,15 +4,19 @@ import os
 import subprocess
 import time
 import threading
+import urllib.request
+import urllib.error
 
 last_cpu_times = [0, 0]
 
 STATS_CACHE_SECONDS = int(os.environ.get("STATS_CACHE_SECONDS", "10"))
 _stats_cache = {"time": 0.0, "data": None}
 
-# ── Startup state — gateway ला signal करायला वापरतो ──
-# "waiting"  : Drive restore अजून चालू आहे
-# "ready"    : Restore झालं, gateway restart झालं
+# Dashboard proxy target
+DASHBOARD_HOST = "127.0.0.1"
+DASHBOARD_PORT = 9119
+
+# Startup state
 _startup_state = {"phase": "waiting", "message": "Restoring state from Google Drive..."}
 _startup_lock = threading.Lock()
 
@@ -119,7 +123,58 @@ def _compute_stats():
         "startup": phase_info
     }
 
-# ── Startup banner — /memory page वर दाखवतो ──
+def is_dashboard_alive():
+    """9119 वर dashboard चालू आहे का check करतो"""
+    try:
+        req = urllib.request.Request(f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}/", method="HEAD")
+        urllib.request.urlopen(req, timeout=2)
+        return True
+    except Exception:
+        return False
+
+def proxy_to_dashboard(handler, path):
+    """Request 9119 ला forward करतो"""
+    target_url = f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}{path}"
+    try:
+        # Request body वाचतो (POST साठी)
+        content_length = int(handler.headers.get('Content-Length', 0))
+        body = handler.rfile.read(content_length) if content_length > 0 else None
+
+        req = urllib.request.Request(target_url, data=body, method=handler.command)
+
+        # Headers copy करतो (hop-by-hop सोडून)
+        skip_headers = {'host', 'connection', 'transfer-encoding', 'keep-alive'}
+        for key, val in handler.headers.items():
+            if key.lower() not in skip_headers:
+                req.add_header(key, val)
+
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            handler.send_response(resp.status)
+            # Response headers copy
+            for key, val in resp.headers.items():
+                if key.lower() not in {'transfer-encoding', 'connection'}:
+                    handler.send_header(key, val)
+            handler.end_headers()
+            handler.wfile.write(resp.read())
+    except urllib.error.HTTPError as e:
+        handler.send_response(e.code)
+        handler.end_headers()
+        handler.wfile.write(e.read())
+    except Exception as e:
+        # Dashboard अजून चालू नाही
+        handler.send_response(503)
+        handler.send_header('Content-type', 'text/html')
+        handler.end_headers()
+        handler.wfile.write(f"""
+        <html><body style="background:#0f172a;color:#f8fafc;font-family:sans-serif;padding:40px;text-align:center;">
+        <h2>⏳ Dashboard Starting...</h2>
+        <p style="color:#94a3b8">Hermes Dashboard अजून चालू होत आहे. 10-15 seconds मध्ये refresh करा.</p>
+        <p style="color:#64748b;font-size:12px">Error: {str(e)}</p>
+        <script>setTimeout(()=>location.reload(), 5000);</script>
+        </body></html>
+        """.encode('utf-8'))
+
+# Startup banner
 STARTUP_BANNER = """
 <div id="startup-banner" style="
     background: linear-gradient(135deg, #1e3a5f, #0f2744);
@@ -173,6 +228,8 @@ HTML_PAGE = """<!DOCTYPE html>
         td { color: #e2e8f0; }
         tr:last-child td { border-bottom: none; }
         footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 12px; }
+        .dashboard-btn { display: inline-block; margin-top: 16px; padding: 10px 24px; background: linear-gradient(135deg, #38bdf8, #0ea5e9); color: #0f172a; border-radius: 8px; font-weight: 700; text-decoration: none; font-size: 14px; }
+        .dashboard-btn:hover { opacity: 0.9; }
         #startup-banner { transition: opacity 0.5s; }
         #startup-banner.hidden { opacity: 0; pointer-events: none; }
     </style>
@@ -185,6 +242,18 @@ HTML_PAGE = """<!DOCTYPE html>
         </header>
 
         """ + STARTUP_BANNER + """
+
+        <!-- Dashboard Quick Link -->
+        <div style="background:#1e293b;border-radius:12px;padding:16px 20px;margin-bottom:24px;border:1px solid #334155;display:flex;align-items:center;justify-content:space-between;">
+          <div>
+            <div style="color:#f8fafc;font-weight:700;font-size:15px;">🖥️ Hermes Web Dashboard</div>
+            <div style="color:#94a3b8;font-size:13px;margin-top:4px;">Sessions, Skills, API Keys, Jobs सगळं इथे</div>
+          </div>
+          <div id="dash-status" style="display:flex;align-items:center;gap:12px;">
+            <span id="dash-badge" style="font-size:12px;color:#64748b;">Checking...</span>
+            <a href="/ui/" target="_blank" class="dashboard-btn">Open Dashboard →</a>
+          </div>
+        </div>
 
         <div class="grid">
             <div class="card">
@@ -239,7 +308,6 @@ HTML_PAGE = """<!DOCTYPE html>
                     document.getElementById('cpu-bar').style.width = data.cpu.percent + '%';
                     document.getElementById('uptime').innerText = data.uptime;
 
-                    // Startup banner update
                     if (data.startup && data.startup.phase === 'ready') {
                         var banner = document.getElementById('startup-banner');
                         if (banner) banner.classList.add('hidden');
@@ -258,8 +326,25 @@ HTML_PAGE = """<!DOCTYPE html>
                 })
                 .catch(function(err) { console.error('Stats fetch error:', err); });
         }
+
+        // Dashboard status check
+        function checkDashboard() {
+            fetch('/ui/').then(res => {
+                var badge = document.getElementById('dash-badge');
+                if (res.ok || res.status === 200) {
+                    badge.innerHTML = '<span style="color:#34d399;">● Online</span>';
+                } else {
+                    badge.innerHTML = '<span style="color:#f59e0b;">● Starting...</span>';
+                }
+            }).catch(() => {
+                document.getElementById('dash-badge').innerHTML = '<span style="color:#f43f5e;">● Offline</span>';
+            });
+        }
+
         setInterval(updateStats, 2000);
+        setInterval(checkDashboard, 5000);
         updateStats();
+        checkDashboard();
     </script>
 </body>
 </html>
@@ -276,7 +361,26 @@ class PingHandler(http.server.BaseHTTPRequestHandler):
         super().log_message(format, *args)
 
     def do_GET(self):
-        if self.path == '/memory':
+        self._handle()
+
+    def do_POST(self):
+        self._handle()
+
+    def do_PUT(self):
+        self._handle()
+
+    def do_DELETE(self):
+        self._handle()
+
+    def do_HEAD(self):
+        if self.path in ('/', '/memory', '/api/stats'):
+            self.send_response(200)
+            self.end_headers()
+        else:
+            proxy_to_dashboard(self, self.path)
+
+    def _handle(self):
+        if self.path == '/memory' or self.path == '/':
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
@@ -287,23 +391,21 @@ class PingHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(get_stats()).encode('utf-8'))
         elif self.path == '/startup-ready':
-            # start.sh हा endpoint call करतो जेव्हा restore पूर्ण होतो
             set_startup_ready()
             self.send_response(200)
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(b"OK")
+        elif self.path.startswith('/ui') or self.path.startswith('/api/') and not self.path == '/api/stats':
+            # /ui/* आणि /api/* (stats सोडून) → 9119 ला proxy
+            proxy_to_dashboard(self, self.path.replace('/ui', '', 1) if self.path.startswith('/ui') else self.path)
         else:
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
             self.wfile.write(b"Hermes Agent is Alive and Running!")
 
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-
 port = int(os.environ.get("PORT", 10000))
 httpd = http.server.HTTPServer(('0.0.0.0', port), PingHandler)
-print(f"Ping server running on port {port} with /memory stats page...")
+print(f"Ping server running on port {port} | Dashboard proxy: /ui/ → 127.0.0.1:9119")
 httpd.serve_forever()
