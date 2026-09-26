@@ -78,7 +78,8 @@ RESOLVED_MODEL="${HERMES_MODEL:-${LLM_MODEL:-${MODEL_DEFAULT:-}}}"
 #
 # Problems:
 # A) System python3 ला PyYAML नाही → Hermes चा स्वतःचा Python वापरतो
-#    (Hermes Python: /root/.hermes/tools/python-*/bin/python3 — yaml built-in)
+#    (Hermes Python: /root/.hermes/tools/python-*/bin/python3 — yaml built-in,
+#    आता Dockerfile मध्ये आपण pip install pyyaml केलं आहे)
 # B) Drive मध्ये corrupt config.yaml आहे (जुन्या patches नंतर sync झाला):
 #    "model: auto\n  provider: 'auto'\n  per_platform: ..." — scalar + orphaned sub-keys
 #    Fix: आधी regex ने corruption clean करतो, मग yaml ने parse + patch
@@ -104,8 +105,9 @@ content = open(cfg_path).read()
 #     provider: "auto"   <- orphaned indented sub-key (yaml invalid)
 #     per_platform: ...
 # Fix: "model: <scalar>\n  <indented lines>" → "model: <scalar>\n"
+# (कोणत्याही indentation वर "model:" सापडलं तरी चालेल, फक्त top-level नाही)
 content = re.sub(
-    r'^(model\s*:[^\n\S]*\S[^\n]*)\n((?:[ \t]+[^\n]*\n)*)',
+    r'^([ \t]*model\s*:[^\n\S]*\S[^\n]*)\n((?:[ \t]+[^\n]*\n)*)',
     lambda m: m.group(1) + '\n',
     content,
     flags=re.MULTILINE
@@ -155,6 +157,26 @@ except Exception as e:
     open(cfg_path, "w").write(content)
     print("config.yaml patched via regex fallback (yaml error: " + str(e) + ")")
 PYEOF
+
+# --- STEP 3: Verify — patch नंतरही parse fail होत असेल तर broken copy बाजूला ठेवून log कर ---
+if ! "$PATCH_PY" -c "
+import sys
+try:
+    import yaml
+    yaml.safe_load(open('$HOME/.hermes/config.yaml').read())
+except ImportError:
+    sys.exit(0)  # yaml module नाहीच, verify करता येत नाही — Dockerfile fix लावा
+except Exception as e:
+    print(e)
+    sys.exit(1)
+" 2>/tmp/config_check.err; then
+  echo "⚠️  config.yaml अजूनही invalid आहे patch नंतर:"
+  cat /tmp/config_check.err
+  cp ~/.hermes/config.yaml "$HOME/.hermes/config.yaml.broken.$(date +%s)" 2>/dev/null || true
+  echo "⚠️  Broken copy backup केली. Telegram/plugin loading fail होत राहील जोपर्यंत हे मॅन्युअली फिक्स होत नाही."
+else
+  echo "✅ config.yaml valid आहे."
+fi
 
 # Symlink Himalaya config
 mkdir -p ~/.config/himalaya
@@ -209,6 +231,11 @@ sync_to_cloud() {
   fi
 }
 
+# Patch नंतर लगेच एकदा push करतो — जेणेकरून fixed config.yaml Drive वर लगेच
+# save होईल आणि पुढच्या restart ला तोच जुना corrupt copy परत restore होणार नाही.
+echo ">> Pushing (possibly fixed) config.yaml back to Drive..."
+sync_to_cloud
+
 (
   LOOP_COUNT=0
   while true; do
@@ -232,8 +259,14 @@ cleanup() {
 trap cleanup SIGTERM SIGINT EXIT
 
 # 9. Start Hermes Dashboard (port 9119)
-echo ">> Starting Hermes Dashboard on port 9119..."
-hermes dashboard --host 0.0.0.0 --port 9119 --no-open --insecure &
+# FIX: 0.0.0.0 वर bind केलं की auth gate engage होतो आणि auth provider
+# नसल्यामुळे dashboard bind refuse करतो (log मधला "Refusing to bind
+# dashboard to 0.0.0.0" error). 127.0.0.1 (loopback) वर bind केलं की auth
+# शिवाय चालतं — मग keep_alive.py मधला /dashboard reverse-proxy route
+# त्याच्यापर्यंत पोहोचवतो, त्यामुळे बाहेरून एकाच public port (10000) वरून
+# dashboard access होतो.
+echo ">> Starting Hermes Dashboard on 127.0.0.1:9119 (proxied via /dashboard)..."
+hermes dashboard --host 127.0.0.1 --port 9119 --no-open &
 DASHBOARD_PID=$!
 echo ">> Dashboard PID: $DASHBOARD_PID"
 
