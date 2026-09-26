@@ -4,11 +4,26 @@ import os
 import subprocess
 import time
 import threading
+import urllib.request
+import urllib.error
 
 last_cpu_times = [0, 0]
 
 STATS_CACHE_SECONDS = int(os.environ.get("STATS_CACHE_SECONDS", "10"))
 _stats_cache = {"time": 0.0, "data": None}
+
+# ── Dashboard reverse-proxy settings ──
+# Hermes dashboard 127.0.0.1:9119 वर (loopback-only, no auth needed) चालतो.
+# Koyeb फक्त एकच public port (PORT / 10000) expose करतो, म्हणून /dashboard
+# खालचे सगळे requests इथून 9119 ला forward करतो.
+DASHBOARD_HOST = "127.0.0.1"
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "9119"))
+DASHBOARD_PREFIX = "/dashboard"
+
+HOP_BY_HOP_HEADERS = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host",
+}
 
 # ── Startup state — gateway ला signal करायला वापरतो ──
 # "waiting"  : Drive restore अजून चालू आहे
@@ -175,6 +190,8 @@ HTML_PAGE = """<!DOCTYPE html>
         footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 12px; }
         #startup-banner { transition: opacity 0.5s; }
         #startup-banner.hidden { opacity: 0; pointer-events: none; }
+        .dash-link { display: inline-block; margin-top: 10px; color: #38bdf8; font-size: 13px; text-decoration: none; }
+        .dash-link:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
@@ -217,6 +234,7 @@ HTML_PAGE = """<!DOCTYPE html>
                     <tr><td colspan="4" style="text-align: center; color: #64748b;">Loading...</td></tr>
                 </tbody>
             </table>
+            <a class="dash-link" href="/dashboard" target="_blank">Open Hermes Dashboard →</a>
         </div>
         <footer>Auto-refreshing every 2 seconds • Koyeb Free Tier Monitoring</footer>
     </div>
@@ -267,6 +285,11 @@ HTML_PAGE = """<!DOCTYPE html>
 
 SILENT_ROUTES = {'/', '/api/stats'}
 
+
+def _is_dashboard_path(path):
+    return path == DASHBOARD_PREFIX or path.startswith(DASHBOARD_PREFIX + "/") or path.startswith(DASHBOARD_PREFIX + "?")
+
+
 class PingHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         request_line = args[0] if args else ''
@@ -275,8 +298,55 @@ class PingHandler(http.server.BaseHTTPRequestHandler):
                 return
         super().log_message(format, *args)
 
+    # ── Reverse proxy to the loopback-only Hermes dashboard ──
+    def _proxy_to_dashboard(self, method):
+        upstream_path = self.path[len(DASHBOARD_PREFIX):] or "/"
+        if not upstream_path.startswith("/"):
+            upstream_path = "/" + upstream_path
+        url = f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}{upstream_path}"
+
+        body = None
+        length = self.headers.get("Content-Length")
+        if length:
+            try:
+                body = self.rfile.read(int(length))
+            except Exception:
+                body = None
+
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
+
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                self.send_response(resp.status)
+                for k, v in resp.getheaders():
+                    if k.lower() not in HOP_BY_HOP_HEADERS:
+                        self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(resp.read())
+        except urllib.error.HTTPError as e:
+            self.send_response(e.code)
+            try:
+                for k, v in (e.headers.items() if e.headers else []):
+                    if k.lower() not in HOP_BY_HOP_HEADERS:
+                        self.send_header(k, v)
+            except Exception:
+                pass
+            self.end_headers()
+            try:
+                self.wfile.write(e.read())
+            except Exception:
+                pass
+        except Exception as e:
+            self.send_response(502)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(f"Dashboard proxy error: {e}".encode())
+
     def do_GET(self):
-        if self.path == '/memory':
+        if _is_dashboard_path(self.path):
+            self._proxy_to_dashboard("GET")
+        elif self.path == '/memory':
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
@@ -299,11 +369,42 @@ class PingHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"Hermes Agent is Alive and Running!")
 
+    def do_POST(self):
+        if _is_dashboard_path(self.path):
+            self._proxy_to_dashboard("POST")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_PUT(self):
+        if _is_dashboard_path(self.path):
+            self._proxy_to_dashboard("PUT")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_DELETE(self):
+        if _is_dashboard_path(self.path):
+            self._proxy_to_dashboard("DELETE")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_PATCH(self):
+        if _is_dashboard_path(self.path):
+            self._proxy_to_dashboard("PATCH")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+        if _is_dashboard_path(self.path):
+            self._proxy_to_dashboard("HEAD")
+        else:
+            self.send_response(200)
+            self.end_headers()
 
 port = int(os.environ.get("PORT", 10000))
 httpd = http.server.HTTPServer(('0.0.0.0', port), PingHandler)
-print(f"Ping server running on port {port} with /memory stats page...")
+print(f"Ping server running on port {port} with /memory stats page and /dashboard proxy...")
 httpd.serve_forever()
