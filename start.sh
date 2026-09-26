@@ -55,7 +55,7 @@ if [ -d ~/.hermes/scripts ]; then
   chmod +x ~/.hermes/scripts/*.sh 2>/dev/null || true
 fi
 
-# 4. STARTUP NOTIFICATION — Drive restore nantar, gateway start honyapurvi
+# 4. STARTUP NOTIFICATION
 FIRST_USER=$(echo "${TELEGRAM_ALLOWED_USERS}" | cut -d',' -f1 | tr -d ' ')
 if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$FIRST_USER" ]; then
   echo ">> Sending Telegram startup notification to ${FIRST_USER}..."
@@ -71,11 +71,37 @@ if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$FIRST_USER" ]; then
   echo ">> Notification sent."
 fi
 
-# Signal keep-alive server that startup is complete (removes /memory banner)
+# Signal keep-alive server that startup is complete
 echo ">> Signaling startup complete..."
 curl -s "http://localhost:${PORT:-10000}/startup-ready" || true
 
-# 5. Background Sync Loop (Every 1 Minute)
+# ── Cache Clean Function ──
+clean_cache() {
+  echo ">> [Cache Clean] Running scheduled cache cleanup..."
+  
+  # Hermes cache folders
+  rm -rf ~/.hermes/cache/* 2>/dev/null || true
+  rm -rf ~/.hermes/audio_cache/* 2>/dev/null || true
+  rm -rf ~/.hermes/image_cache/* 2>/dev/null || true
+  rm -rf ~/.hermes/tmp/* 2>/dev/null || true
+  
+  # Python bytecode cache
+  find ~/.hermes -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+  find ~/.hermes -name "*.pyc" -delete 2>/dev/null || true
+  
+  # pip cache
+  rm -rf /root/.cache/pip 2>/dev/null || true
+  
+  # /tmp junk
+  find /tmp -maxdepth 1 -type f -mmin +30 -delete 2>/dev/null || true
+  
+  # Node.js npm cache
+  rm -rf /root/.npm/_cacache 2>/dev/null || true
+
+  echo ">> [Cache Clean] Done. RAM free: $(awk '/MemAvailable/{print $2}' /proc/meminfo) kB"
+}
+
+# 5. Background Sync Loop (दर 5 मिनिटे — RAM वाचवण्यासाठी)
 sync_to_cloud() {
   if [ -f ~/.config/rclone/rclone.conf ]; then
     rclone sync ~/.hermes/ "$REMOTE_BACKUP" \
@@ -88,14 +114,21 @@ sync_to_cloud() {
 }
 
 (
+  LOOP_COUNT=0
   while true; do
-    sleep 60
+    sleep 300  # दर 5 मिनिटे sync (60s वरून वाढवलं — RAM spike कमी)
     sync_to_cloud
+
+    LOOP_COUNT=$(( LOOP_COUNT + 1 ))
+    # दर 12 loops = दर 1 तास → cache clean
+    if [ $(( LOOP_COUNT % 12 )) -eq 0 ]; then
+      clean_cache
+    fi
   done
 ) &
 SYNC_PID=$!
 
-# 6. Trap for graceful shutdown
+# 6. Trap for graceful shutdown — final sync before exit
 cleanup() {
   echo ">> Container shutting down. Performing final sync..."
   kill $SYNC_PID 2>/dev/null || true
@@ -104,13 +137,9 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT EXIT
 
-# 7. Start Hermes Gateway
-echo ">> Starting Hermes Gateway..."
-hermes config set terminal.backend local || true
-hermes auth add custom \
-  --type api-key \
-  --api-key "${CUSTOM_API_KEY}" \
-  --inference-url "${CUSTOM_API_BASE_URL}" || true
-hermes gateway run || echo ">> Hermes gateway exited."
+# 7. Start Watchdog (which manages Hermes Gateway)
+echo ">> Starting Watchdog..."
+/app/watchdog.sh &
 
-cleanup
+# 8. Wait forever (watchdog manages gateway)
+wait
