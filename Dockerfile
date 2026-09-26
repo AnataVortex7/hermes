@@ -6,7 +6,9 @@ RUN apt-get update && apt-get install -y curl git sudo bash unzip libatomic1 && 
     rm -rf /var/lib/apt/lists/*
 
 # Install Hermes Agent
-RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+ENV HERMES_VERSION=0.21.4
+RUN curl -fsSL https://github.com/NousResearch/hermes-agent/releases/download/v${HERMES_VERSION}/hermes-linux-amd64 -o /usr/local/bin/hermes && \
+    chmod +x /usr/local/bin/hermes
 
 # ── FIX: Hermes च्या bundled python मध्ये PyYAML install कर ──
 # start.sh मधला config.yaml patch script याच python ने चालतो. yaml module
