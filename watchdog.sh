@@ -3,7 +3,7 @@
 # Hermes Watchdog — safe, low-RAM, exponential backoff
 # ============================================================
 
-WATCHDOG_CHECK_INTERVAL="${WATCHDOG_CHECK_INTERVAL:-30}"
+WATCHDOG_CHECK_INTERVAL="${WATCHDOG_CHECK_INTERVAL:-60}"
 GATEWAY_MAX_RESTARTS="${GATEWAY_MAX_RESTARTS:-8}"
 
 # Exponential backoff: 5s, 10s, 20s, 40s, 60s, 60s, 60s...
@@ -28,7 +28,6 @@ get_delay() {
 }
 
 start_gateway() {
-    # आधीचा process clean करा
     if [ -n "$GATEWAY_PID" ] && kill -0 "$GATEWAY_PID" 2>/dev/null; then
         log "🛑 Killing old gateway PID $GATEWAY_PID..."
         kill -TERM "$GATEWAY_PID" 2>/dev/null || true
@@ -47,6 +46,25 @@ is_gateway_alive() {
     [ -n "$GATEWAY_PID" ] && kill -0 "$GATEWAY_PID" 2>/dev/null
 }
 
+# ── RAM check: जर RAM < 50MB free असेल तर cache clean करतो ──
+check_ram_and_clean() {
+    local avail_kb
+    avail_kb=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo "99999")
+    local avail_mb=$(( avail_kb / 1024 ))
+
+    if [ "$avail_mb" -lt 50 ]; then
+        log "⚠️  Low RAM: ${avail_mb}MB free. Emergency cache clean running..."
+        rm -rf ~/.hermes/cache/* 2>/dev/null || true
+        rm -rf ~/.hermes/audio_cache/* 2>/dev/null || true
+        rm -rf ~/.hermes/image_cache/* 2>/dev/null || true
+        rm -rf ~/.hermes/tmp/* 2>/dev/null || true
+        find /tmp -maxdepth 1 -type f -mmin +10 -delete 2>/dev/null || true
+        rm -rf /root/.npm/_cacache 2>/dev/null || true
+        find ~/.hermes -name "*.pyc" -delete 2>/dev/null || true
+        log "✅ Emergency cache clean done. RAM free now: $(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)MB"
+    fi
+}
+
 log "🐕 Watchdog started. Check interval: ${WATCHDOG_CHECK_INTERVAL}s, Max restarts: $GATEWAY_MAX_RESTARTS"
 
 # पहिला start
@@ -55,9 +73,10 @@ start_gateway
 while true; do
     sleep "$WATCHDOG_CHECK_INTERVAL"
 
+    # RAM check हर loop मध्ये
+    check_ram_and_clean
+
     if is_gateway_alive; then
-        # Gateway alive — restart count हळूहळू reset करतो
-        # (stable राहिल्यावर backoff counter कमी होतो)
         if [ "$RESTART_COUNT" -gt 0 ]; then
             RESTART_COUNT=$(( RESTART_COUNT - 1 ))
             log "✅ Gateway stable. Cooling down restart count → $RESTART_COUNT"
@@ -71,7 +90,6 @@ while true; do
 
     if [ "$RESTART_COUNT" -ge "$GATEWAY_MAX_RESTARTS" ]; then
         log "🚨 Too many crashes. Container restart trigger करतो..."
-        # keep_alive.py kill केल्यावर Koyeb health check fail होतो → container restart
         pkill -f "keep_alive.py" 2>/dev/null || true
         sleep 10
         exit 1
