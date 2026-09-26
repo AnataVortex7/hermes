@@ -76,15 +76,18 @@ RESOLVED_MODEL="${HERMES_MODEL:-${LLM_MODEL:-${MODEL_DEFAULT:-}}}"
 
 # 5. Patch config.yaml
 #
-# Problems:
-# A) System python3 ला PyYAML नाही → Hermes चा स्वतःचा Python वापरतो
-#    (Hermes Python: /root/.hermes/tools/python-*/bin/python3 — yaml built-in,
-#    आता Dockerfile मध्ये आपण pip install pyyaml केलं आहे)
-# B) Drive मध्ये corrupt config.yaml आहे (जुन्या patches नंतर sync झाला):
-#    "model: auto\n  provider: 'auto'\n  per_platform: ..." — scalar + orphaned sub-keys
-#    Fix: आधी regex ने corruption clean करतो, मग yaml ने parse + patch
+# असली Root cause: "model:" हा तुझ्यासाठी scalar नसून एक nested mapping आहे
+# (provider/base_url/api_key/api_mode/default — custom API साठी). जुना patch
+# script प्रत्येक restart ला `cfg["model"] = "auto"` करून हा संपूर्ण mapping
+# उडवायचा (regex-fallback मध्ये तर अजून वाईट — फक्त "model:" ओळ scalar व्हायची,
+# खालचे provider/api_key इ. child keys तसेच राहायचे → invalid YAML). हीच खरी
+# corruption निर्माण करणारी गोष्ट होती.
+#
+# Fix: model ला कधीच blind "auto" करायचं नाही. त्याऐवजी जुना (कितीही corrupt
+# असो) top-level "model:" block पूर्ण काढून टाकायचा आणि env vars वरून तोच
+# clean mapping परत बनवायचा — दर वेळी, त्यामुळे corruption पुन्हा तयारच होणार नाही.
 
-# Hermes Python शोधतो (yaml available असतो)
+# Hermes Python शोधतो (yaml available असतो — Dockerfile मध्ये pip install केलं आहे)
 HERMES_PY=$(ls /root/.hermes/tools/python-*/bin/python3 2>/dev/null | sort -V | tail -1)
 PATCH_PY="${HERMES_PY:-python3}"
 echo ">> Config patch using: $PATCH_PY"
@@ -99,34 +102,50 @@ if not os.path.exists(cfg_path):
 
 content = open(cfg_path).read()
 
-# --- STEP 1: Pre-fix corruption ---
-# Drive मधून restore होणारा corrupt config असा दिसतो:
-#   model: auto          <- scalar value (मागच्या patch ने set केला)
-#     provider: "auto"   <- orphaned indented sub-key (yaml invalid)
-#     per_platform: ...
-# Fix: "model: <scalar>\n  <indented lines>" → "model: <scalar>\n"
-# (कोणत्याही indentation वर "model:" सापडलं तरी चालेल, फक्त top-level नाही)
+def env_first(*names):
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v
+    return None
+
+# start.sh च्याच coalescing logic प्रमाणे — हे actual container env vars आहेत,
+# त्यामुळे bash local variables (RESOLVED_BASE_URL इ.) export नसले तरी चालतं
+base_url = env_first("OPENAI_BASE_URL", "OPENAI_API_BASE", "CUSTOM_BASE_URL", "CUSTOM_API_BASE")
+api_key = os.environ.get("CUSTOM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+default_model = env_first("HERMES_MODEL", "LLM_MODEL", "MODEL_DEFAULT") or "auto"
+
+# --- STEP 1: जुना top-level "model:" block (कुठल्याही shape चा असो) पूर्ण काढ ---
+# "model:" पासून सुरू करून पुढचा top-level key (column 0 वर) सुरू होईपर्यंत सगळं हटवतो.
 content = re.sub(
-    r'^([ \t]*model\s*:[^\n\S]*\S[^\n]*)\n((?:[ \t]+[^\n]*\n)*)',
-    lambda m: m.group(1) + '\n',
+    r'^model\s*:.*?(?=^\S|\Z)',
+    '',
     content,
-    flags=re.MULTILINE
+    flags=re.MULTILINE | re.DOTALL,
 )
 
-# --- STEP 2: YAML parse + patch ---
+# --- STEP 2: नवीन, स्वच्छ "model:" mapping env vars वरून जोड ---
+model_lines = ["model:"]
+if base_url:
+    model_lines.append("  provider: custom")
+    model_lines.append(f'  base_url: "{base_url}"')
+    if api_key:
+        model_lines.append(f'  api_key: "{api_key}"')
+    model_lines.append("  api_mode: chat_completions")
+    model_lines.append(f"  default: {default_model}")
+else:
+    model_lines.append(f"  default: {default_model}")
+
+content = content.rstrip("\n") + "\n\n" + "\n".join(model_lines) + "\n"
+
+# --- STEP 3: yaml सह parse + ui.language पॅच + नीट dump ---
 try:
     import yaml
 
     cfg = yaml.safe_load(content)
-
     if not isinstance(cfg, dict):
-        print("config.yaml unexpected format, using regex fallback")
-        raise ValueError("not a dict")
+        raise ValueError("config.yaml root is not a mapping")
 
-    # model → auto (nested dict असो किंवा scalar)
-    cfg["model"] = "auto"
-
-    # language → en
     if not isinstance(cfg.get("ui"), dict):
         cfg["ui"] = {}
     cfg["ui"]["language"] = "en"
@@ -134,25 +153,16 @@ try:
     open(cfg_path, "w").write(
         yaml.dump(cfg, default_flow_style=False, allow_unicode=True, sort_keys=False)
     )
-    print("config.yaml patched via yaml: model=auto, language=en")
+    print("config.yaml patched via yaml: model rebuilt from env, language=en")
 
 except Exception as e:
-    # Fallback: yaml failed (still corrupt or no yaml module)
-    # Step 1 ने corruption already clean केली, आता regex ने model + language patch
-
-    # language
+    # yaml module नाही किंवा वेगळीच corruption सापडली — regex fallback (फक्त language)
     if re.search(r'^ui\s*:', content, re.MULTILINE):
         content = re.sub(r'(language\s*:)\s*\S+', r'\1 en', content)
     elif 'language:' in content:
         content = re.sub(r'language:\s*\S+', 'language: en', content)
     else:
         content += '\nui:\n  language: en\n'
-
-    # model (corruption already removed in step 1, just ensure value is auto)
-    if re.search(r'^model\s*:', content, re.MULTILINE):
-        content = re.sub(r'^model\s*:[^\n]*', 'model: auto', content, flags=re.MULTILINE)
-    else:
-        content += '\nmodel: auto\n'
 
     open(cfg_path, "w").write(content)
     print("config.yaml patched via regex fallback (yaml error: " + str(e) + ")")
