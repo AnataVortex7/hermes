@@ -49,15 +49,31 @@ fi
 
 REMOTE_BACKUP="${RCLONE_REMOTE:-gdrive:hermes_backup}"
 
+# NOTE: these excludes are shared by BOTH the restore and the backup sync below.
+# hermes-agent/, tools/, and installs/ are the app install (node_modules, the
+# bundled python runtime, the built hermes binary) — they're baked into the
+# Docker image at build time and must NEVER be touched by the Drive sync.
+# Previously the sync swept these up too, and since rclone drops symlinks by
+# default, every backup silently stripped the executable symlinks out of the
+# app install. Restoring that broken copy over the good build-time install is
+# what caused "hermes: not found" and the endless watchdog restart loop.
+RCLONE_STATE_EXCLUDES=(
+  --exclude "cache/**"
+  --exclude "audio_cache/**"
+  --exclude "image_cache/**"
+  --exclude "runtime/**"
+  --exclude "hermes-agent/**"
+  --exclude "tools/**"
+  --exclude "installs/**"
+  --exclude "node_modules/**"
+)
+
 # 3. Restore from Google Drive
 if [ -f ~/.config/rclone/rclone.conf ]; then
   echo ">> Restoring Hermes state from Google Drive ($REMOTE_BACKUP)..."
   mkdir -p ~/.hermes
   rclone sync "$REMOTE_BACKUP" ~/.hermes/ \
-    --exclude "cache/**" \
-    --exclude "audio_cache/**" \
-    --exclude "image_cache/**" \
-    --exclude "runtime/**" \
+    "${RCLONE_STATE_EXCLUDES[@]}" \
     --drive-chunk-size 8M || echo ">> Restore skipped."
 fi
 
@@ -111,10 +127,7 @@ clean_cache() {
 sync_to_cloud() {
   if [ -f ~/.config/rclone/rclone.conf ]; then
     rclone sync ~/.hermes/ "$REMOTE_BACKUP" \
-      --exclude "cache/**" \
-      --exclude "audio_cache/**" \
-      --exclude "image_cache/**" \
-      --exclude "runtime/**" \
+      "${RCLONE_STATE_EXCLUDES[@]}" \
       --drive-chunk-size 8M --fast-list || true
   fi
 }
