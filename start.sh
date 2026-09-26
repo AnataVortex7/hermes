@@ -32,7 +32,7 @@ fi
 
 REMOTE_BACKUP="${RCLONE_REMOTE:-gdrive:hermes_backup}"
 
-# 3. Restore from Google Drive
+# 3. Restore from Google Drive (Sync EVERYTHING except cache/tmp)
 if [ -f ~/.config/rclone/rclone.conf ]; then
   echo ">> Restoring Hermes state from Google Drive ($REMOTE_BACKUP)..."
   mkdir -p ~/.hermes
@@ -71,26 +71,37 @@ if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$FIRST_USER" ]; then
   echo ">> Notification sent."
 fi
 
-# Signal keep-alive that startup is complete
+# Signal keep-alive server that startup is complete
 echo ">> Signaling startup complete..."
 curl -s "http://localhost:${PORT:-10000}/startup-ready" || true
 
 # ── Cache Clean Function ──
 clean_cache() {
   echo ">> [Cache Clean] Running scheduled cache cleanup..."
+  
+  # Hermes cache folders
   rm -rf ~/.hermes/cache/* 2>/dev/null || true
   rm -rf ~/.hermes/audio_cache/* 2>/dev/null || true
   rm -rf ~/.hermes/image_cache/* 2>/dev/null || true
   rm -rf ~/.hermes/tmp/* 2>/dev/null || true
+  
+  # Python bytecode cache
   find ~/.hermes -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
   find ~/.hermes -name "*.pyc" -delete 2>/dev/null || true
+  
+  # pip cache
   rm -rf /root/.cache/pip 2>/dev/null || true
+  
+  # /tmp junk
   find /tmp -maxdepth 1 -type f -mmin +30 -delete 2>/dev/null || true
+  
+  # Node.js npm cache
   rm -rf /root/.npm/_cacache 2>/dev/null || true
-  echo ">> [Cache Clean] Done. RAM free: $(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)MB"
+
+  echo ">> [Cache Clean] Done. RAM free: $(awk '/MemAvailable/{print $2}' /proc/meminfo) kB"
 }
 
-# 5. Background Sync + Cache Clean Loop
+# 5. Background Sync Loop (दर 5 मिनिटे — RAM वाचवण्यासाठी)
 sync_to_cloud() {
   if [ -f ~/.config/rclone/rclone.conf ]; then
     rclone sync ~/.hermes/ "$REMOTE_BACKUP" \
@@ -105,8 +116,9 @@ sync_to_cloud() {
 (
   LOOP_COUNT=0
   while true; do
-    sleep 300
+    sleep 300  # दर 5 मिनिटे sync (60s वरून वाढवलं — RAM spike कमी)
     sync_to_cloud
+
     LOOP_COUNT=$(( LOOP_COUNT + 1 ))
     # दर 12 loops = दर 1 तास → cache clean
     if [ $(( LOOP_COUNT % 12 )) -eq 0 ]; then
@@ -116,7 +128,7 @@ sync_to_cloud() {
 ) &
 SYNC_PID=$!
 
-# 6. Trap for graceful shutdown
+# 6. Trap for graceful shutdown — final sync before exit
 cleanup() {
   echo ">> Container shutting down. Performing final sync..."
   kill $SYNC_PID 2>/dev/null || true
@@ -125,18 +137,9 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT EXIT
 
-# 7. Start Hermes Dashboard (port 9119 — keep_alive proxy करेल)
-echo ">> Starting Hermes Dashboard on port 9119..."
-hermes dashboard --host 0.0.0.0 --port 9119 --no-open --insecure &
-DASHBOARD_PID=$!
-echo ">> Dashboard PID: $DASHBOARD_PID"
-
-# Dashboard ला 3 seconds warmup
-sleep 3
-
-# 8. Start Watchdog (manages Hermes Gateway)
+# 7. Start Watchdog (which manages Hermes Gateway)
 echo ">> Starting Watchdog..."
 /app/watchdog.sh &
 
-# Wait forever
+# 8. Wait forever (watchdog manages gateway)
 wait
