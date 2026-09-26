@@ -94,21 +94,34 @@ RESOLVED_MODEL="${HERMES_MODEL:-${LLM_MODEL:-${MODEL_DEFAULT:-}}}"
   [ -n "$SLACK_ALLOWED_USERS" ]       && echo "SLACK_ALLOWED_USERS=${SLACK_ALLOWED_USERS}"
 } > ~/.hermes/.env
 
-# 5. NOW patch config.yaml language → English (after restore, so it sticks
-# even if the restored config.yaml had a different/no language line)
+# 5. NOW patch config.yaml — language → English, model → auto
+# Drive restore नंतर config.yaml मध्ये जुना model (e.g. anthropic/claude-opus-4.6)
+# hardcoded असतो. config.yaml ला .env पेक्षा जास्त precedence असतो, त्यामुळे
+# .env मधला HERMES_MODEL=auto ignore होतो आणि Hermes anthropic/ prefix बघून
+# Anthropic/OpenRouter try करतो — दोन्ही keys नाहीत → crash.
+# Fix: दर boot ला model → auto force करतो (custom API "auto" = Gemini pool mode).
 python3 -c "
-import os
+import os, re
 cfg_path = os.path.expanduser('~/.hermes/config.yaml')
 try:
     content = open(cfg_path).read()
+
+    # language patch
     if 'language:' in content:
-        import re
         content = re.sub(r'language:\s*\S+', 'language: en', content)
     else:
         content += '\nui:\n  language: en\n'
-    open(cfg_path,'w').write(content)
-except Exception:
-    pass
+
+    # model patch — anthropic/claude-* किंवा कोणताही hardcoded model → auto
+    if re.search(r'^\s*model\s*:', content, re.MULTILINE):
+        content = re.sub(r'^(\s*model\s*:).*$', r'\1 auto', content, flags=re.MULTILINE)
+    else:
+        content += '\nmodel: auto\n'
+
+    open(cfg_path, 'w').write(content)
+    print('config.yaml patched: language=en, model=auto')
+except Exception as e:
+    print(f'config.yaml patch failed: {e}')
 " 2>/dev/null || true
 
 # Symlink Himalaya config (depends on restored skills, so after restore)
