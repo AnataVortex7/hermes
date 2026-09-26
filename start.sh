@@ -50,6 +50,14 @@ if [ -f ~/.config/rclone/rclone.conf ]; then
     --drive-chunk-size 8M || echo ">> Restore skipped."
 fi
 
+# Coalesce: you've set the base URL / model under several different names
+# (leftover from trying different setups). Hermes' docs only ever read
+# OPENAI_BASE_URL (paired with OPENAI_API_KEY, for a custom OpenAI-compatible
+# endpoint) and HERMES_MODEL/LLM_MODEL — pick the first non-empty one under
+# each and write ONLY the name Hermes actually looks for.
+RESOLVED_BASE_URL="${OPENAI_BASE_URL:-${OPENAI_API_BASE:-${CUSTOM_BASE_URL:-${CUSTOM_API_BASE:-}}}}"
+RESOLVED_MODEL="${HERMES_MODEL:-${LLM_MODEL:-${MODEL_DEFAULT:-}}}"
+
 # 4. NOW write .env from env vars — this always wins, restore can't touch it
 # since .env is excluded from the sync above. Per Hermes' official env-vars
 # reference (hermes-agent.nousresearch.com/docs/reference/environment-variables),
@@ -62,10 +70,16 @@ fi
   echo "UNKNOWN44_API_KEY=${CUSTOM_API_KEY}"
   echo "CUSTOM_API_KEY=${CUSTOM_API_KEY}"
 
+  # This line was missing entirely before — without it, Hermes has a key but
+  # no endpoint to send it to for a non-native model id like "anthropic/...",
+  # hence "No LLM provider configured" even though api_keys.openai shows "set".
+  [ -n "$RESOLVED_BASE_URL" ]         && echo "OPENAI_BASE_URL=${RESOLVED_BASE_URL}"
+
   [ -n "$OPENROUTER_API_KEY" ]        && echo "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}"
-  [ -n "$OPENAI_BASE_URL" ]           && echo "OPENAI_BASE_URL=${OPENAI_BASE_URL}"
-  [ -n "$HERMES_MODEL" ]              && echo "HERMES_MODEL=${HERMES_MODEL}"
-  [ -n "$LLM_MODEL" ]                 && echo "LLM_MODEL=${LLM_MODEL}"
+  if [ -n "$RESOLVED_MODEL" ]; then
+    echo "HERMES_MODEL=${RESOLVED_MODEL}"
+    echo "LLM_MODEL=${RESOLVED_MODEL}"
+  fi
 
   [ -n "$TELEGRAM_BOT_TOKEN" ]        && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}"
   [ -n "$TELEGRAM_ALLOWED_USERS" ]    && echo "TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}"
