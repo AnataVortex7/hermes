@@ -24,8 +24,7 @@ fi
 
 REMOTE_BACKUP="${RCLONE_REMOTE:-gdrive:hermes_backup}"
 
-# rclone_sync — array ऐवजी function वापरतो (bash arrays /bin/sh वर crash करतात)
-# सगळे excludes इथेच hardcode — restore आणि backup दोन्हींसाठी वापरतो.
+# rclone_sync — bash array नाही (sh compatible), excludes function मध्ये hardcode
 rclone_sync() {
   rclone "$@" \
     --exclude "cache/**" \
@@ -75,41 +74,48 @@ RESOLVED_MODEL="${HERMES_MODEL:-${LLM_MODEL:-${MODEL_DEFAULT:-}}}"
   [ -n "$SLACK_ALLOWED_USERS" ]        && echo "SLACK_ALLOWED_USERS=${SLACK_ALLOWED_USERS}"
 } > ~/.hermes/.env
 
-# 5. Patch config.yaml — language → en, model block → auto
-# Problem: Drive restore नंतर config.yaml मध्ये model: nested block असतो:
-#   model:
-#     default: "anthropic/claude-opus-4.6"   ← YAML error cause
-# Fix: पूर्ण model: block (indented sub-keys सकट) → scalar "model: auto" replace करतो.
-python3 -c "
-import os, re
-cfg_path = os.path.expanduser('~/.hermes/config.yaml')
+# 5. Patch config.yaml using PyYAML
+# Regex approach: config.yaml मध्ये model: nested block असतो (model.default, model.provider
+# इत्यादी sub-keys). Regex ने काही sub-keys miss होतात → YAML syntax error.
+# PyYAML fix: YAML parse करतो → model: auto set करतो → valid YAML dump करतो.
+# Structure काहीही असो (nested dict, scalar, per_platform) — सगळं handle होतं.
+python3 - << 'PYEOF'
+import os, sys
+try:
+    import yaml
+except ImportError:
+    print("PyYAML not found, skipping config patch")
+    sys.exit(0)
+
+cfg_path = os.path.expanduser("~/.hermes/config.yaml")
+if not os.path.exists(cfg_path):
+    print("config.yaml not found, skipping patch")
+    sys.exit(0)
+
 try:
     content = open(cfg_path).read()
+    cfg = yaml.safe_load(content)
 
-    # language patch
-    if re.search(r'^ui\s*:', content, re.MULTILINE):
-        content = re.sub(r'(language\s*:)\s*\S+', r'\1 en', content)
-    elif 'language:' in content:
-        content = re.sub(r'language:\s*\S+', 'language: en', content)
-    else:
-        content += '\nui:\n  language: en\n'
+    if not isinstance(cfg, dict):
+        print("config.yaml unexpected format, skipping patch")
+        sys.exit(0)
 
-    # model patch — scalar किंवा nested block दोन्ही handle करतो
-    if re.search(r'^model\s*:', content, re.MULTILINE):
-        content = re.sub(
-            r'^model\s*:[^\n]*(?:\n[ \t]+[^\n]*)*',
-            'model: auto',
-            content,
-            flags=re.MULTILINE
-        )
-    else:
-        content += '\nmodel: auto\n'
+    # model → auto (nested dict असो किंवा scalar, दोन्ही replace होतात)
+    cfg["model"] = "auto"
 
-    open(cfg_path, 'w').write(content)
-    print('config.yaml patched: language=en, model=auto')
+    # language → en
+    if "ui" not in cfg or not isinstance(cfg.get("ui"), dict):
+        cfg["ui"] = {}
+    cfg["ui"]["language"] = "en"
+
+    open(cfg_path, "w").write(
+        yaml.dump(cfg, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    )
+    print("config.yaml patched: model=auto, language=en")
+
 except Exception as e:
-    print('config.yaml patch failed: ' + str(e))
-" 2>/dev/null || true
+    print("config.yaml patch failed: " + str(e))
+PYEOF
 
 # Symlink Himalaya config
 mkdir -p ~/.config/himalaya
