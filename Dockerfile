@@ -9,8 +9,7 @@ WORKDIR /app
 
 COPY keep_alive.py /app/keep_alive.py
 COPY start.sh /app/start.sh
-COPY watchdog.sh /app/watchdog.sh
-RUN chmod +x /app/start.sh /app/watchdog.sh
+RUN chmod +x /app/start.sh
 
 COPY bin/ /app/bin/
 RUN chmod +x /app/bin/*
