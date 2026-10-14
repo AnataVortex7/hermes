@@ -34,8 +34,11 @@ rclone_sync() {
     --exclude ".env"
 }
 
-# 3. Restore from Google Drive
+# 3. Restore from Google Drive (ensure remote folder exists or handle first run)
 if [ -f ~/.config/rclone/rclone.conf ]; then
+  echo ">> Ensuring remote backup directory exists..."
+  rclone mkdir "$REMOTE_BACKUP" 2>/dev/null || true
+  
   echo ">> Restoring PicoW Clow state from Google Drive ($REMOTE_BACKUP)..."
   rclone_sync sync "$REMOTE_BACKUP" ~/.picow_clow/ --drive-chunk-size 8M || echo ">> Restore skipped."
 fi
@@ -47,6 +50,7 @@ curl -s "http://localhost:${PORT:-10000}/startup-ready" || true
 # 4. Background Sync Loop
 sync_to_cloud() {
   if [ -f ~/.config/rclone/rclone.conf ]; then
+    rclone mkdir "$REMOTE_BACKUP" 2>/dev/null || true
     rclone_sync sync ~/.picow_clow/ "$REMOTE_BACKUP" --drive-chunk-size 8M --fast-list || true
   fi
 }
