@@ -10,7 +10,7 @@ if [ -f /app/keep_alive.py ]; then
   python3 /app/keep_alive.py &
 fi
 
-mkdir -p ~/.picow_clow
+mkdir -p ~/.picow_clow ~/.picoclaw
 
 # 2. Setup Rclone configuration
 mkdir -p ~/.config/rclone
@@ -34,13 +34,28 @@ rclone_sync() {
     --exclude ".env"
 }
 
+# PicoClaw state (sessions, memory, workspace) is backed up next to the rest.
+# config.json / .security.yml hold the bot token + API key, so they are NOT
+# synced to Drive - they are regenerated from env vars on every boot.
+PICOCLAW_REMOTE="${REMOTE_BACKUP}/picoclaw"
+picoclaw_sync() {
+  rclone "$@" \
+    --exclude "config.json" \
+    --exclude ".security.yml" \
+    --exclude "*.log" \
+    --exclude "cache/**"
+}
+
 # 3. Restore from Google Drive (ensure remote folder exists or handle first run)
 if [ -f ~/.config/rclone/rclone.conf ]; then
   echo ">> Ensuring remote backup directory exists..."
   rclone mkdir "$REMOTE_BACKUP" 2>/dev/null || true
   
   echo ">> Restoring PicoW Clow state from Google Drive ($REMOTE_BACKUP)..."
-  rclone_sync sync "$REMOTE_BACKUP" ~/.picow_clow/ --drive-chunk-size 8M || echo ">> Restore skipped."
+  rclone_sync sync "$REMOTE_BACKUP" ~/.picow_clow/ --drive-chunk-size 8M --exclude "picoclaw/**" || echo ">> Restore skipped."
+  echo ">> Restoring PicoClaw state..."
+  rclone mkdir "$PICOCLAW_REMOTE" 2>/dev/null || true
+  picoclaw_sync sync "$PICOCLAW_REMOTE" ~/.picoclaw/ --drive-chunk-size 8M || echo ">> PicoClaw restore skipped."
 fi
 
 # Signal keep-alive that startup is complete
@@ -51,7 +66,8 @@ curl -s "http://localhost:${PORT:-10000}/startup-ready" || true
 sync_to_cloud() {
   if [ -f ~/.config/rclone/rclone.conf ]; then
     rclone mkdir "$REMOTE_BACKUP" 2>/dev/null || true
-    rclone_sync sync ~/.picow_clow/ "$REMOTE_BACKUP" --drive-chunk-size 8M --fast-list || true
+    rclone_sync sync ~/.picow_clow/ "$REMOTE_BACKUP" --drive-chunk-size 8M --fast-list --exclude "picoclaw/**" || true
+    picoclaw_sync sync ~/.picoclaw/ "$PICOCLAW_REMOTE" --drive-chunk-size 8M --fast-list || true
   fi
 }
 
@@ -67,22 +83,30 @@ sync_to_cloud
 SYNC_PID=$!
 
 # 5. Trap for graceful shutdown
+APP_PID=""
 cleanup() {
+  trap - SIGTERM SIGINT EXIT
   echo ">> Container shutting down. Performing final sync..."
+  [ -n "$APP_PID" ] && kill "$APP_PID" 2>/dev/null || true
   kill $SYNC_PID 2>/dev/null || true
   sync_to_cloud
   exit 0
 }
 trap cleanup SIGTERM SIGINT EXIT
 
-# 6. Start PicoW Clow Main Process / Application
-if [ -f /app/main.py ]; then
-  echo ">> Starting PicoW Clow main.py..."
+# 6. Start PicoClaw gateway (Telegram long-polling, no inbound port needed)
+if command -v picoclaw >/dev/null 2>&1 && python3 /app/setup_picoclaw.py; then
+  echo ">> Starting PicoClaw gateway (Telegram)..."
+  picoclaw gateway &
+  APP_PID=$!
+  wait "$APP_PID"
+elif [ -f /app/main.py ]; then
+  echo ">> Starting main.py..."
   python3 /app/main.py
 elif [ -f /app/app.py ]; then
-  echo ">> Starting PicoW Clow app.py..."
+  echo ">> Starting app.py..."
   python3 /app/app.py
 else
-  echo ">> No main.py or app.py found, entering infinite sleep..."
+  echo ">> PicoClaw not started (check TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOW_FROM / LLM_API_KEY). Keeping container alive..."
   sleep infinity
 fi
