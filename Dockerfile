@@ -1,3 +1,5 @@
+FROM docker.io/tailscale/tailscale:stable AS tailscale
+
 FROM python:3.10-slim
 
 # Install tools + libatomic1 (Node.js साठी)
@@ -22,6 +24,10 @@ RUN set -e; \
     mkdir -p /tmp/pc && curl -fsSL "$URL" | tar -xz -C /tmp/pc; \
     install -m 0755 "$(find /tmp/pc -type f -name picoclaw | head -n1)" /usr/local/bin/picoclaw; \
     rm -rf /tmp/pc; picoclaw --help >/dev/null 2>&1 || true
+
+# Tailscale (official static binaries, run in userspace mode - no TUN device needed)
+COPY --from=tailscale /usr/local/bin/tailscaled /usr/local/bin/tailscaled
+COPY --from=tailscale /usr/local/bin/tailscale /usr/local/bin/tailscale
 
 WORKDIR /app
 

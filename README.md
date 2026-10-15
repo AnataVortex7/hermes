@@ -28,3 +28,23 @@ LLM_API_BASE=https://my-api.example.com/v1
 LLM_MODEL=openai/<your-model-id>
 LLM_API_KEY=<your-key>
 ```
+
+## Tailscale (private access to dashboards from your phone)
+Runs in the background in userspace mode (no TUN / NET_ADMIN needed on Koyeb).
+
+| Variable | Notes |
+|---|---|
+| `TAILSCALE_AUTHKEY` | Tailscale admin -> Settings -> Keys -> Generate auth key. Tick **Reusable** and **Ephemeral** (state is in RAM, so every deploy would otherwise leave a stale device behind) |
+| `TAILSCALE_HOSTNAME` | optional, default `hermes` |
+| `TAILSCALE_PORTS` | optional, default `10000,9119,18790,18800` - local ports forwarded to your tailnet |
+
+Install the Tailscale app on your phone, log in to the same account, then open
+`http://hermes:10000/memory` (or `http://<100.x.y.z>:10000/memory`; the IP is
+printed in the Koyeb logs as `[tailscale] connected, IPv4: ...`).
+
+Port 10000 = keep_alive (`/memory`, `/dashboard`), 9119 = Hermes dashboard,
+18790 = PicoClaw gateway health, 18800 = PicoClaw web UI (only if something listens there).
+
+## Debugging the model
+On boot the log prints `[picoclaw] model=... api_base_host=...`. If it says
+`openai/gpt-5.2`, the `LLM_MODEL` env var was not picked up (name must be exactly `LLM_MODEL`).

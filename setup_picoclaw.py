@@ -41,7 +41,7 @@ if not allow:
 model_name = os.environ.get("LLM_MODEL_NAME", "default")
 model = {
     "model_name": model_name,
-    "model": os.environ.get("LLM_MODEL", "openai/gpt-5.2"),
+    "model": os.environ.get("LLM_MODEL", "").strip() or "openai/gpt-5.2",
     "api_key": api_key,
     "request_timeout": 300,
 }
@@ -69,4 +69,10 @@ cfg.setdefault("channels", {})["telegram"] = {
 
 cfg_path.write_text(json.dumps(cfg, indent=2))
 cfg_path.chmod(0o600)
+from urllib.parse import urlparse
+_base = os.environ.get("LLM_API_BASE", "").strip()
 print(f">> [picoclaw] wrote {cfg_path} (telegram allow_from: {len(allow)} user(s))")
+print(f">> [picoclaw] model={model['model']} alias={model_name} api_base_host={urlparse(_base).netloc or '(none -> api.openai.com)'}")
+if not os.environ.get("LLM_MODEL", "").strip():
+    print(">> [picoclaw] WARNING: env var LLM_MODEL is not set, falling back to openai/gpt-5.2. "
+          "Set LLM_MODEL (exact name, case-sensitive) in the Koyeb environment variables.", file=sys.stderr)

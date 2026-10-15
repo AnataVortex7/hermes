@@ -10,6 +10,37 @@ if [ -f /app/keep_alive.py ]; then
   python3 /app/keep_alive.py &
 fi
 
+# 1b. TAILSCALE (background, userspace mode: works on Koyeb without TUN/NET_ADMIN)
+# Needs TAILSCALE_AUTHKEY (use a Reusable + Ephemeral key). Services that listen
+# only on 127.0.0.1 are forwarded to your tailnet with `tailscale serve --tcp`.
+if [ -n "$TAILSCALE_AUTHKEY" ] && command -v tailscaled >/dev/null 2>&1; then
+  (
+    TS_SOCK=/tmp/tailscale/tailscaled.sock
+    TS="tailscale --socket=$TS_SOCK"
+    mkdir -p /tmp/tailscale
+    echo ">> [tailscale] starting tailscaled (userspace)..."
+    tailscaled --tun=userspace-networking --state=mem: --socket="$TS_SOCK" \
+      --socks5-server=localhost:1055 >/tmp/tailscale/tailscaled.log 2>&1 &
+    for _ in $(seq 1 30); do [ -S "$TS_SOCK" ] && break; sleep 1; done
+    if timeout 90 $TS up --auth-key="$TAILSCALE_AUTHKEY" \
+         --hostname="${TAILSCALE_HOSTNAME:-hermes}" --accept-dns=false; then
+      echo ">> [tailscale] connected, IPv4: $($TS ip -4 2>/dev/null | head -n1)"
+      for p in $(echo "${TAILSCALE_PORTS:-10000,9119,18790,18800}" | tr ',' ' '); do
+        if $TS serve --bg --tcp="$p" "tcp://127.0.0.1:$p" >/dev/null 2>&1; then
+          echo ">> [tailscale] forwarding tailnet port $p -> 127.0.0.1:$p"
+        else
+          echo ">> [tailscale] could not forward port $p"
+        fi
+      done
+    else
+      echo ">> [tailscale] 'tailscale up' failed - last log lines:"
+      tail -n 15 /tmp/tailscale/tailscaled.log 2>/dev/null
+    fi
+  ) &
+elif [ -n "$TAILSCALE_AUTHKEY" ]; then
+  echo ">> [tailscale] TAILSCALE_AUTHKEY set but tailscaled binary is missing"
+fi
+
 mkdir -p ~/.picow_clow ~/.picoclaw
 
 # 2. Setup Rclone configuration
