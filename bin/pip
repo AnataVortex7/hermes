@@ -1,6 +1,6 @@
 #!/bin/bash
 # Wrapper: runs the real pip, then (on a successful `install`) records the
-# package names in ~/.hermes/installed/pip.list so start.sh can replay them
+# package names in ~/.picow_clow/installed/pip.list so start.sh can replay them
 # on the next boot, after that file has been pulled back from Drive.
 set -o pipefail
 
@@ -32,10 +32,10 @@ if [ "$1" = "install" ] && [ $rc -eq 0 ]; then
         esac
     done
     if [ "$HAS_REQ_FILE" = "1" ]; then
-        echo "⚠️  [pip wrapper] '-r/--requirement' installs aren't auto-persisted across restarts -- add the packages to ~/.hermes/installed/pip.list yourself if you need them to survive." >&2
+        echo "⚠️  [pip wrapper] '-r/--requirement' installs aren't auto-persisted across restarts -- add the packages to ~/.picow_clow/installed/pip.list yourself if you need them to survive." >&2
     fi
     if [ ${#pkgs[@]} -gt 0 ]; then
-        LOGDIR="$HOME/.hermes/installed"
+        LOGDIR="$HOME/.picow_clow/installed"
         mkdir -p "$LOGDIR"
         LOGFILE="$LOGDIR/pip.list"
         touch "$LOGFILE"

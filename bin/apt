@@ -1,6 +1,6 @@
 #!/bin/bash
 # Wrapper: runs the real apt-get, then (on a successful `install`) records
-# the package names in ~/.hermes/installed/apt.list so start.sh can replay
+# the package names in ~/.picow_clow/installed/apt.list so start.sh can replay
 # them (with a fresh `apt-get update`) on the next boot.
 set -o pipefail
 
@@ -30,7 +30,7 @@ if [ "$HAS_INSTALL" = "1" ] && [ $rc -eq 0 ]; then
         esac
     done
     if [ ${#pkgs[@]} -gt 0 ]; then
-        LOGDIR="$HOME/.hermes/installed"
+        LOGDIR="$HOME/.picow_clow/installed"
         mkdir -p "$LOGDIR"
         LOGFILE="$LOGDIR/apt.list"
         touch "$LOGFILE"

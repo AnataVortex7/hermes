@@ -1,6 +1,6 @@
 #!/bin/bash
 # Wrapper: runs the real npm, then (on a successful global `install`) records
-# the package names in ~/.hermes/installed/npm.list so start.sh can replay
+# the package names in ~/.picow_clow/installed/npm.list so start.sh can replay
 # them on the next boot. Local (non -g) installs aren't tracked -- they live
 # in a project's node_modules, which isn't part of the Hermes backup anyway.
 set -o pipefail
@@ -28,7 +28,7 @@ if { [ "$1" = "install" ] || [ "$1" = "i" ] || [ "$1" = "add" ]; } && [ $rc -eq 
         esac
     done
     if [ "$IS_GLOBAL" = "1" ] && [ ${#pkgs[@]} -gt 0 ]; then
-        LOGDIR="$HOME/.hermes/installed"
+        LOGDIR="$HOME/.picow_clow/installed"
         mkdir -p "$LOGDIR"
         LOGFILE="$LOGDIR/npm.list"
         touch "$LOGFILE"
