@@ -48,3 +48,14 @@ Port 10000 = keep_alive (`/memory`, `/dashboard`), 9119 = Hermes dashboard,
 ## Debugging the model
 On boot the log prints `[picoclaw] model=... api_base_host=...`. If it says
 `openai/gpt-5.2`, the `LLM_MODEL` env var was not picked up (name must be exactly `LLM_MODEL`).
+
+## Browser (Playwright/Chromium)
+Chromium is baked into the image (`PLAYWRIGHT_BROWSERS_PATH=/opt/pw`).
+See `examples/browser_example.py` for flags that work in a 512MB container
+(`--no-sandbox --disable-dev-shm-usage`, one page at a time, always `browser.close()`).
+If it still gets OOM-killed, use `requests` / `curl_cffi` instead.
+
+## Persistent installs
+`apt-get` / `pip` / `npm -g` wrappers in `bin/` log packages to
+`~/.picow_clow/installed/*.list` (synced to Drive); `start.sh` re-installs them on boot.
+Drive sync only starts after a successful restore, so an empty local folder cannot wipe the backup.

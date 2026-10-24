@@ -78,16 +78,32 @@ picoclaw_sync() {
 }
 
 # 3. Restore from Google Drive (ensure remote folder exists or handle first run)
+# SYNC_SAFE=1 only if the restore finished OK. Otherwise the background sync
+# is disabled, so an empty local folder can never wipe the Drive backup.
+SYNC_SAFE=0
 if [ -f ~/.config/rclone/rclone.conf ]; then
   echo ">> Ensuring remote backup directory exists..."
   rclone mkdir "$REMOTE_BACKUP" 2>/dev/null || true
-  
-  echo ">> Restoring PicoW Clow state from Google Drive ($REMOTE_BACKUP)..."
-  rclone_sync sync "$REMOTE_BACKUP" ~/.picow_clow/ --drive-chunk-size 8M --exclude "picoclaw/**" || echo ">> Restore skipped."
-  echo ">> Restoring PicoClaw state..."
   rclone mkdir "$PICOCLAW_REMOTE" 2>/dev/null || true
-  picoclaw_sync sync "$PICOCLAW_REMOTE" ~/.picoclaw/ --drive-chunk-size 8M || echo ">> PicoClaw restore skipped."
+
+  echo ">> Restoring PicoW Clow state from Google Drive ($REMOTE_BACKUP)..."
+  if rclone_sync sync "$REMOTE_BACKUP" ~/.picow_clow/ --drive-chunk-size 8M --exclude "picoclaw/**" \
+     && picoclaw_sync sync "$PICOCLAW_REMOTE" ~/.picoclaw/ --drive-chunk-size 8M; then
+    SYNC_SAFE=1
+    echo ">> Restore OK."
+  else
+    echo ">> Restore FAILED - background sync to Drive is DISABLED to protect the backup."
+  fi
 fi
+
+# 3b. Replay packages installed earlier via the bin/ wrappers (apt/pip/npm)
+INST=~/.picow_clow/installed
+if [ -s "$INST/apt.list" ]; then
+  echo ">> Re-installing apt packages: $(tr '\n' ' ' < $INST/apt.list)"
+  apt-get update -qq && apt-get install -y --no-install-recommends $(cat "$INST/apt.list") || echo ">> apt replay failed"
+fi
+[ -s "$INST/pip.list" ] && { echo ">> Re-installing pip packages..."; pip install $(cat "$INST/pip.list") || echo ">> pip replay failed"; }
+[ -s "$INST/npm.list" ] && command -v npm >/dev/null && { echo ">> Re-installing npm globals..."; npm install -g $(cat "$INST/npm.list") || echo ">> npm replay failed"; }
 
 # Signal keep-alive that startup is complete
 echo ">> Signaling startup complete..."
@@ -95,7 +111,7 @@ curl -s "http://localhost:${PORT:-10000}/startup-ready" || true
 
 # 4. Background Sync Loop
 sync_to_cloud() {
-  if [ -f ~/.config/rclone/rclone.conf ]; then
+  if [ -f ~/.config/rclone/rclone.conf ] && [ "$SYNC_SAFE" = "1" ]; then
     rclone mkdir "$REMOTE_BACKUP" 2>/dev/null || true
     rclone_sync sync ~/.picow_clow/ "$REMOTE_BACKUP" --drive-chunk-size 8M --fast-list --exclude "picoclaw/**" || true
     picoclaw_sync sync ~/.picoclaw/ "$PICOCLAW_REMOTE" --drive-chunk-size 8M --fast-list || true

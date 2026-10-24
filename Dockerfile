@@ -25,6 +25,13 @@ RUN set -e; \
     install -m 0755 "$(find /tmp/pc -type f -name picoclaw | head -n1)" /usr/local/bin/picoclaw; \
     rm -rf /tmp/pc; picoclaw --help >/dev/null 2>&1 || true
 
+# Playwright + Chromium, baked into the image (so it survives restarts).
+# --with-deps pulls the system libs Chromium needs.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw
+RUN pip install --no-cache-dir playwright && \
+    playwright install --with-deps chromium && \
+    rm -rf /var/lib/apt/lists/* /root/.cache/pip
+
 # Tailscale (official static binaries, run in userspace mode - no TUN device needed)
 COPY --from=tailscale /usr/local/bin/tailscaled /usr/local/bin/tailscaled
 COPY --from=tailscale /usr/local/bin/tailscale /usr/local/bin/tailscale
@@ -43,7 +50,7 @@ ENV PATH="/app/bin:${PATH}"
 # RAM optimization environment variables
 ENV PYTHONOPTIMIZE=1
 ENV PYTHONDONTWRITEBYTECODE=1
-ENV NODE_OPTIONS="--max-old-space-size=128"
+ENV NODE_OPTIONS="--max-old-space-size=256"
 ENV MALLOC_ARENA_MAX=2
 
 EXPOSE 10000
