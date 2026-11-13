@@ -23,6 +23,14 @@ def main() -> None:
     picoclaw_home.mkdir(parents=True, exist_ok=True)
     Path(workspace).mkdir(parents=True, exist_ok=True)
 
+    # Remove stale PID files restored from Drive backup so gateway doesn't fail singleton check
+    for pid_file in picoclaw_home.rglob("*.pid"):
+        try:
+            pid_file.unlink()
+            print(f"Removed stale PID file: {pid_file}")
+        except OSError as exc:
+            print(f"Warning: could not remove {pid_file}: {exc}", file=sys.stderr)
+
     tg_token = require_env("TELEGRAM_BOT_TOKEN")
     allow_from_raw = require_env("TELEGRAM_ALLOW_FROM")
     allow_from = [u.strip() for u in allow_from_raw.split(",") if u.strip()]
