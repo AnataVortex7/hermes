@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
-"""Generate ~/.picoclaw/config.json from environment variables AND launch a local
-streaming-to-JSON keepalive proxy on 127.0.0.1:18799.
-
-Required env:
-  TELEGRAM_BOT_TOKEN   token from @BotFather
-  TELEGRAM_ALLOW_FROM  comma separated numeric Telegram user IDs (from @userinfobot)
-  LLM_API_KEY          API key for your LLM provider
-
-Optional env:
-  LLM_MODEL            provider/model string      (default: openai/gpt-5.2)
-  LLM_MODEL_NAME       alias used by the agent    (default: default)
-  LLM_API_BASE         custom OpenAI-compatible base URL
-  LLM_REQUEST_TIMEOUT  HTTP timeout in seconds    (default: 360 -> 6 minutes)
+"""Generate ~/.picoclaw/config.json from environment variables with:
+1. Full unrestricted command/script/cron execution permissions (restrict_to_workspace=False,
+   enable_deny_patterns=False, allow_remote=True, cron.allow_command=True)
+2. 360-second (6-minute) request timeout
+3. Local Stream-to-JSON bridge on 127.0.0.1:18799 to prevent Koyeb/Cloudflare 504 timeouts
 """
 import json
 import os
@@ -275,10 +267,35 @@ if cfg_path.exists():
         cfg = {}
 
 cfg["version"] = 2
-cfg.setdefault("agents", {}).setdefault("defaults", {})
-cfg["agents"]["defaults"]["workspace"] = str(home / "workspace")
-cfg["agents"]["defaults"]["model_name"] = model_name
-cfg["agents"]["defaults"]["request_timeout"] = req_timeout
+
+# 1. Agent defaults: disable workspace sandbox restriction & allow reading/running anywhere
+defaults = cfg.setdefault("agents", {}).setdefault("defaults", {})
+defaults["workspace"] = str(home / "workspace")
+defaults["restrict_to_workspace"] = False
+defaults["allow_read_outside_workspace"] = True
+defaults["model_name"] = model_name
+defaults["request_timeout"] = req_timeout
+defaults["max_tokens"] = 32768
+defaults["max_tool_iterations"] = 50
+
+# 2. Tools settings: grant full exec & cron script execution access
+tools = cfg.setdefault("tools", {})
+tools["allow_read_paths"] = ["/"]
+tools["allow_write_paths"] = ["/"]
+tools["exec"] = {
+    "enabled": True,
+    "allow_remote": True,
+    "enable_deny_patterns": False,
+    "custom_deny_patterns": [],
+    "custom_allow_patterns": [".*"],
+    "timeout_seconds": 360,
+}
+tools["cron"] = {
+    "enabled": True,
+    "allow_command": True,
+    "exec_timeout_minutes": 10,
+}
+
 cfg["model_list"] = [model]
 cfg.setdefault("channels", {})["telegram"] = {
     "enabled": True,
@@ -302,5 +319,5 @@ sec_content = (
 sec_path.write_text(sec_content, encoding="utf-8")
 sec_path.chmod(0o600)
 
-print(f">> [picoclaw] wrote {cfg_path} & {sec_path} (telegram allow_from: {len(allow)} user(s), request_timeout: {req_timeout}s)")
+print(f">> [picoclaw] wrote {cfg_path} & {sec_path} (FULL EXEC + CRON ACCESS ENABLED, request_timeout: {req_timeout}s)")
 print(f">> [picoclaw] model={model['model']} alias={model_name} upstream_host={urlparse(upstream_base).netloc or '(none)'}")
