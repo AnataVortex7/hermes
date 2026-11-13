@@ -1,78 +1,85 @@
-#!/usr/bin/env python3
-"""Generate ~/.picoclaw/config.json from environment variables.
-
-Secrets (bot token, API key) stay in Koyeb env vars and are never backed up to
-Google Drive: start.sh excludes config.json from the rclone sync, and this
-script rebuilds it on every boot.
-
-Required env:
-  TELEGRAM_BOT_TOKEN   token from @BotFather
-  TELEGRAM_ALLOW_FROM  comma separated numeric Telegram user IDs (from @userinfobot)
-  LLM_API_KEY          API key for your LLM provider
-
-Optional env:
-  LLM_MODEL            provider/model string      (default: openai/gpt-5.2)
-  LLM_MODEL_NAME       alias used by the agent    (default: default)
-  LLM_API_BASE         custom OpenAI-compatible base URL
-"""
 import json
 import os
 import sys
 from pathlib import Path
 
-home = Path(os.environ.get("PICOCLAW_HOME", Path.home() / ".picoclaw"))
-home.mkdir(parents=True, exist_ok=True)
-cfg_path = home / "config.json"
 
-token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-allow = [x.strip() for x in os.environ.get("TELEGRAM_ALLOW_FROM", "").split(",") if x.strip()]
-api_key = os.environ.get("LLM_API_KEY", "").strip()
+def require_env(name: str) -> str:
+    val = os.environ.get(name, "").strip()
+    if not val:
+        print(f"Error: required environment variable {name} is not set.", file=sys.stderr)
+        sys.exit(1)
+    return val
 
-missing = [n for n, v in (("TELEGRAM_BOT_TOKEN", token), ("LLM_API_KEY", api_key)) if not v]
-if missing:
-    print(f">> [picoclaw] missing env: {', '.join(missing)}", file=sys.stderr)
-    sys.exit(1)
 
-if not allow:
-    # Empty allow_from means *anyone* can talk to the bot and spend your LLM credits.
-    print(">> [picoclaw] TELEGRAM_ALLOW_FROM is empty - refusing to start an open bot.", file=sys.stderr)
-    sys.exit(1)
+def main() -> None:
+    picoclaw_home = Path(
+        os.environ.get("PICOCLAW_HOME", os.path.expanduser("~/.picoclaw"))
+    ).expanduser()
+    workspace = os.environ.get(
+        "PICOCLAW_WORKSPACE", str(picoclaw_home / "workspace")
+    ).strip()
 
-model_name = os.environ.get("LLM_MODEL_NAME", "default")
-model = {
-    "model_name": model_name,
-    "model": os.environ.get("LLM_MODEL", "").strip() or "openai/gpt-5.2",
-    "api_key": api_key,
-    "request_timeout": 300,
-}
-if os.environ.get("LLM_API_BASE"):
-    model["api_base"] = os.environ["LLM_API_BASE"]
+    picoclaw_home.mkdir(parents=True, exist_ok=True)
+    Path(workspace).mkdir(parents=True, exist_ok=True)
 
-# Start from an existing config (e.g. one made by `picoclaw onboard`) so other
-# settings survive, then overwrite only what this script owns.
-cfg = {}
-if cfg_path.exists():
+    tg_token = require_env("TELEGRAM_BOT_TOKEN")
+    allow_from_raw = require_env("TELEGRAM_ALLOW_FROM")
+    allow_from = [u.strip() for u in allow_from_raw.split(",") if u.strip()]
+    if not allow_from:
+        print("Error: TELEGRAM_ALLOW_FROM must contain at least one user ID.", file=sys.stderr)
+        sys.exit(1)
+
+    api_key = require_env("LLM_API_KEY")
+    model_name = os.environ.get("LLM_MODEL_NAME", "default").strip() or "default"
+    model = os.environ.get("LLM_MODEL", "openai/gpt-5.2").strip() or "openai/gpt-5.2"
+    api_base = os.environ.get("LLM_API_BASE", "").strip()
+
     try:
-        cfg = json.loads(cfg_path.read_text())
-    except Exception:
-        cfg = {}
+        request_timeout = int(os.environ.get("LLM_REQUEST_TIMEOUT", "360").strip())
+    except ValueError:
+        request_timeout = 360
 
-cfg.setdefault("agents", {}).setdefault("defaults", {})
-cfg["agents"]["defaults"]["workspace"] = str(home / "workspace")
-cfg["agents"]["defaults"]["model_name"] = model_name
-cfg["model_list"] = [model]
-cfg.setdefault("channels", {})["telegram"] = {
-    "enabled": True,
-    "token": token,
-    "allow_from": allow,
-}
+    model_entry = {
+        "model_name": model_name,
+        "model": model,
+        "api_key": api_key,
+        "request_timeout": request_timeout,
+    }
+    if api_base:
+        model_entry["api_base"] = api_base
 
-cfg_path.write_text(json.dumps(cfg, indent=2))
-cfg_path.chmod(0o600)
-from urllib.parse import urlparse
-_base = os.environ.get("LLM_API_BASE", "").strip()
-print(f">> [picoclaw] wrote {cfg_path} (telegram allow_from: {len(allow)} user(s))")
-print(f">> [picoclaw] model={model['model']} alias={model_name} api_base_host={urlparse(_base).netloc or '(none -> api.openai.com)'}")
-if not os.environ.get("LLM_MODEL", "").strip():
-    print(">> [picoclaw] WARNING: env var LLM_MODEL is not set, falling back to openai/gpt-5.2. "
-          "Set LLM_MODEL (exact name, case-sensitive) in the Koyeb environment variables.", file=sys.stderr)
+    cfg = {
+        "agents": {
+            "defaults": {
+                "workspace": workspace,
+                "model_name": model_name,
+                "restrict_to_workspace": False,
+            }
+        },
+        "model_list": [model_entry],
+        "channels": {
+            "telegram": {
+                "enabled": True,
+                "token": tg_token,
+                "allow_from": allow_from,
+            }
+        },
+        "tools": {
+            "exec": {
+                "enable_deny_patterns": False,
+                "allow_remote": True,
+            },
+            "cron": {
+                "allow_command": True,
+            },
+        },
+    }
+
+    config_path = picoclaw_home / "config.json"
+    config_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    print(f"Generated unrestricted PicoClaw config at {config_path}")
+
+
+if __name__ == "__main__":
+    main()
