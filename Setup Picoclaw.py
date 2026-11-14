@@ -2,7 +2,7 @@
 """Generate ~/.picoclaw/config.json from environment variables with:
 1. Full unrestricted command/script/cron execution permissions (restrict_to_workspace=False,
    enable_deny_patterns=False, allow_remote=True, cron.allow_command=True)
-2. 360-second (6-minute) request timeout
+2. 600-second (10-minute) request timeout
 3. Local Stream-to-JSON bridge on 127.0.0.1:18799 to prevent Koyeb/Cloudflare 504 timeouts
 """
 import json
@@ -20,7 +20,7 @@ cfg_path = home / "config.json"
 token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 allow = [x.strip() for x in os.environ.get("TELEGRAM_ALLOW_FROM", "").split(",") if x.strip()]
 api_key = os.environ.get("LLM_API_KEY", "").strip()
-req_timeout = int(os.environ.get("LLM_REQUEST_TIMEOUT", "360").strip() or "360")
+req_timeout = max(600, int(os.environ.get("LLM_REQUEST_TIMEOUT", "600").strip() or "600"))
 
 missing = [n for n, v in (("TELEGRAM_BOT_TOKEN", token), ("LLM_API_KEY", api_key)) if not v]
 if missing:
@@ -195,7 +195,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 data=raw_body if raw_body else None,
                 headers=fwd_headers,
                 stream=True,
-                timeout=(15, TIMEOUT_SECS),
+                timeout=(60, TIMEOUT_SECS),
             )
         except Exception as e:
             err_bytes = json.dumps({{"error": {{"message": str(e), "type": "bridge_error"}}}}).encode("utf-8")
@@ -288,7 +288,7 @@ tools["exec"] = {
     "enable_deny_patterns": False,
     "custom_deny_patterns": [],
     "custom_allow_patterns": [".*"],
-    "timeout_seconds": 360,
+    "timeout_seconds": 600,
 }
 tools["cron"] = {
     "enabled": True,

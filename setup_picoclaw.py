@@ -154,14 +154,26 @@ def main() -> None:
     model = os.environ.get("LLM_MODEL", "openai/gpt-5.2").strip() or "openai/gpt-5.2"
     upstream_base = os.environ.get("LLM_API_BASE", "").strip() or "https://api.openai.com/v1"
 
-    # Minimum 10 minutes for every LLM request (custom APIs can be slow with a 250k context).
-    # The env var can only RAISE it: an old LLM_REQUEST_TIMEOUT=360 on Koyeb must not lower it.
+    # Minimum 10 minutes (600s) for every LLM request (custom APIs can be slow with a 250k context).
+    # The env var can only RAISE it: an old LLM_REQUEST_TIMEOUT=360 or 90s timeout on Koyeb must not lower it.
     MIN_TIMEOUT = 600
     try:
         request_timeout = int(os.environ.get("LLM_REQUEST_TIMEOUT", "").strip() or MIN_TIMEOUT)
     except ValueError:
         request_timeout = MIN_TIMEOUT
     request_timeout = max(request_timeout, MIN_TIMEOUT)
+
+    try:
+        first_byte_timeout = int(float(os.environ.get("LLM_FIRST_BYTE_TIMEOUT", "").strip() or request_timeout))
+    except ValueError:
+        first_byte_timeout = request_timeout
+    first_byte_timeout = max(first_byte_timeout, MIN_TIMEOUT)
+
+    try:
+        stream_idle_timeout = int(float(os.environ.get("LLM_STREAM_IDLE_TIMEOUT", "").strip() or request_timeout))
+    except ValueError:
+        stream_idle_timeout = request_timeout
+    stream_idle_timeout = max(stream_idle_timeout, MIN_TIMEOUT)
 
     try:
         proxy_port = int(os.environ.get("LOCAL_LLM_PROXY_PORT", "18799").strip())
@@ -178,6 +190,9 @@ def main() -> None:
     proxy_env["PICOCLAW_UPSTREAM_API_BASE"] = upstream_base
     proxy_env["LOCAL_LLM_PROXY_PORT"] = str(proxy_port)
     proxy_env["LLM_REQUEST_TIMEOUT"] = str(request_timeout)
+    proxy_env["LLM_FIRST_BYTE_TIMEOUT"] = str(first_byte_timeout)
+    proxy_env["LLM_STREAM_IDLE_TIMEOUT"] = str(stream_idle_timeout)
+    proxy_env.setdefault("LLM_TIMEOUT_RETRIES", "0")
     proxy_env["HERMES_WORKSPACE"] = workspace
 
     subprocess.Popen(
@@ -242,6 +257,7 @@ def main() -> None:
                 "max_tool_iterations": env_int("LLM_MAX_TOOL_ITERATIONS", 100),
                 # sub-agents (default 5 min) get the same >=10 min
                 "subturn": {"default_timeout_minutes": MIN_TIMEOUT // 60},
+                "request_timeout": request_timeout,
                 "context_window": context_window,
                 "max_tokens": max_tokens,
             }

@@ -110,9 +110,9 @@ action without doing it. Three layers handle that:
 | `LLM_REMINDER` | `1` | `0` = do not append the per-request reminder |
 | `LLM_GUARD_MAX_RETRIES` | `2` | retries of bad/empty/stalled replies. Each retry is one more call on your model quota - set `1` or `0` if quota is tight |
 | `LLM_HTTP_RETRIES` | `3` | retries on 408/429/5xx/connection errors (backoff `LLM_RETRY_BACKOFF`, default 2s, doubling) |
-| `LLM_FIRST_BYTE_TIMEOUT` | `90` | seconds without any response byte from your API before the call is treated as hung. Keep it BELOW Cloudflare's ~100 s silence limit, which is what produces `504 error code: 504` even when your API later logs `200 Success` |
-| `LLM_STREAM_IDLE_TIMEOUT` | `90` | seconds of silence in the middle of a streamed reply before it is treated as hung (keep-alive comments from the API reset it) |
-| `LLM_TIMEOUT_RETRIES` | `2` | retries after a hang / 504 / 524 / 408 (each retry is a fresh call, so your auto-router can pick another model) |
+| `LLM_FIRST_BYTE_TIMEOUT` | `600` | seconds (10 min minimum) without any response byte from your API before the call is treated as hung |
+| `LLM_STREAM_IDLE_TIMEOUT` | `600` | seconds (10 min minimum) of silence in the middle of a streamed reply before it is treated as hung |
+| `LLM_TIMEOUT_RETRIES` | `0` | retries after a hang / 504 / 524 / 408 (`0` = do not send a new request on timeout) |
 | `LLM_LITE_PATTERN` | `lite` | regex on the model name returned by your API that switches to the stronger reminder |
 | `LLM_PROXY_ACCESS_LOG` | `0` | `1` = also log every HTTP request line |
 
@@ -125,4 +125,4 @@ Note: `Setup Picoclaw.py` (with a space) is an old copy and is not used by the D
 of your API, not a PicoClaw timer. If one call to a slow model (e.g. 184 s) sends no byte for ~100 s, the edge cuts
 the client with 504 while the backend keeps working and later logs 200. Real fix is in the API: open the SSE
 response immediately and send a comment line (`: keepalive` + blank line) every ~15 s until the model answers.
-The proxy ignores comment lines, so this is safe. Until then the proxy cuts silent calls at 90 s and retries.
+The proxy ignores comment lines, so this is safe. By default the proxy waits the full 10 minutes (600 s) without cutting silent calls at 90 s or sending duplicate retries.

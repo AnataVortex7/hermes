@@ -60,13 +60,11 @@ TIMEOUT = _env_int("LLM_REQUEST_TIMEOUT", 600)
 GUARD = (os.environ.get("LLM_GUARD", "1").strip() != "0")
 REMINDER = (os.environ.get("LLM_REMINDER", "1").strip() != "0")
 HTTP_RETRIES = _env_int("LLM_HTTP_RETRIES", 3)          # transient upstream errors (429/5xx/conn)
-# The custom API sits behind Cloudflare/Koyeb, which cuts a connection that is SILENT for ~100 s and
-# answers "504 error code: 504" - even when the backend later finishes fine (logged as 200 Success).
-# So we give up on silence BEFORE that (90 s) and retry, which normally lands on a faster model.
-# Backend keep-alive bytes (SSE comments) reset these timers, so healthy slow calls are not cut.
-FIRST_BYTE_TIMEOUT = _env_float("LLM_FIRST_BYTE_TIMEOUT", 90)    # no response bytes for this long -> hung
-STREAM_IDLE_TIMEOUT = _env_float("LLM_STREAM_IDLE_TIMEOUT", 90)  # no SSE bytes for this long -> hung
-TIMEOUT_RETRIES = _env_int("LLM_TIMEOUT_RETRIES", 2)    # retries after a hang / 504 / 524
+# Default 10 minutes (600 s) for first byte and stream idle so slow requests are not cut at 90-100 s.
+# TIMEOUT_RETRIES defaults to 0 so a slow/timed-out request does not automatically trigger a duplicate new request.
+FIRST_BYTE_TIMEOUT = _env_float("LLM_FIRST_BYTE_TIMEOUT", TIMEOUT)    # default 600s (10 min)
+STREAM_IDLE_TIMEOUT = _env_float("LLM_STREAM_IDLE_TIMEOUT", TIMEOUT)  # default 600s (10 min)
+TIMEOUT_RETRIES = _env_int("LLM_TIMEOUT_RETRIES", 0)    # default 0: do not send a new request on timeout/504
 BAD_REPLY_RETRIES = _env_int("LLM_GUARD_MAX_RETRIES", 2)  # bad/empty/stalled replies
 BACKOFF = _env_float("LLM_RETRY_BACKOFF", 2.0)
 LITE_RE = re.compile(os.environ.get("LLM_LITE_PATTERN", "lite") or "lite", re.I)
