@@ -12,6 +12,9 @@ Container runs `keep_alive.py` (health/dashboard on port 10000) and
 | `LLM_API_KEY` | yes | key of your LLM provider |
 | `LLM_MODEL` | no | `provider/model`, default `openai/gpt-5.2` |
 | `LLM_API_BASE` | no | custom OpenAI-compatible endpoint |
+| `LLM_REQUEST_TIMEOUT` | no | seconds per LLM request; default and minimum `600` (10 min), can only be raised |
+| `LLM_CONTEXT_WINDOW` | no | model context size in tokens, default `250000` |
+| `LLM_MAX_TOKENS` | no | max output tokens per reply, default `32768` |
 | `RCLONE_CONFIG_BASE64` | no | Google Drive backup of PicoClaw state |
 
 `~/.picoclaw/config.json` is rebuilt from these on every boot and is **not**
@@ -59,3 +62,13 @@ If it still gets OOM-killed, use `requests` / `curl_cffi` instead.
 `apt-get` / `pip` / `npm -g` wrappers in `bin/` log packages to
 `~/.picow_clow/installed/*.list` (synced to Drive); `start.sh` re-installs them on boot.
 Drive sync only starts after a successful restore, so an empty local folder cannot wipe the backup.
+
+## Full permissions (cron + exec from Telegram)
+`setup_picoclaw.py` follows https://docs.picoclaw.io/docs/configuration/exec/ and the Security Sandbox page:
+`exec.enabled/allow_remote = true`, `enable_deny_patterns = false`, `restrict_to_workspace = false`,
+`isolation.enabled = false`, and `tools.cron.command_allowed_remotes = ["telegram"]`
+(Telegram is not an "internal" channel, so cron shell commands were rejected without it).
+Override with env `CRON_COMMAND_ALLOWED_REMOTES` (e.g. `telegram:123456789` or `*`).
+On every boot a marked block is (re)written into `workspace/USER.md` telling the bot it has full
+permissions, so stale "cron is restricted" notes in its memory stop making it refuse.
+Python packages persist via `PYTHONUSERBASE=~/.picow_clow/pyuser` (synced to Drive).

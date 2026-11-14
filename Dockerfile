@@ -28,7 +28,7 @@ RUN set -e; \
 # Playwright + Chromium, baked into the image (so it survives restarts).
 # --with-deps pulls the system libs Chromium needs.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw
-RUN pip install --no-cache-dir playwright && \
+RUN pip install --no-cache-dir requests beautifulsoup4 playwright && \
     playwright install --with-deps chromium && \
     rm -rf /var/lib/apt/lists/* /root/.cache/pip
 

@@ -43,6 +43,16 @@ fi
 
 mkdir -p ~/.picow_clow ~/.picoclaw
 
+# Persistent Python packages: EVERY pip install (pip, pip3, `python3 -m pip`,
+# run by the agent or by hand) goes to ~/.picow_clow/pyuser, which is synced to
+# Drive and restored on boot. This does not depend on the bin/ wrappers, which
+# `python3 -m pip install ...` bypasses.
+export PYTHONUSERBASE="$HOME/.picow_clow/pyuser"
+export PIP_USER=1
+export PIP_BREAK_SYSTEM_PACKAGES=1
+export PATH="$PYTHONUSERBASE/bin:$PATH"
+mkdir -p "$PYTHONUSERBASE"
+
 # 2. Setup Rclone configuration
 mkdir -p ~/.config/rclone
 if [ -n "$RCLONE_CONFIG_BASE64" ]; then
@@ -95,6 +105,8 @@ if [ -f ~/.config/rclone/rclone.conf ]; then
     echo ">> Restore FAILED - background sync to Drive is DISABLED to protect the backup."
   fi
 fi
+
+mkdir -p "$PYTHONUSERBASE"
 
 # 3b. Replay packages installed earlier via the bin/ wrappers (apt/pip/npm)
 INST=~/.picow_clow/installed
