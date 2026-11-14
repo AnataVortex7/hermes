@@ -68,6 +68,11 @@ TIMEOUT_RETRIES = _env_int("LLM_TIMEOUT_RETRIES", 0)    # default 0: do not send
 BAD_REPLY_RETRIES = _env_int("LLM_GUARD_MAX_RETRIES", 2)  # bad/empty/stalled replies
 BACKOFF = _env_float("LLM_RETRY_BACKOFF", 2.0)
 LITE_RE = re.compile(os.environ.get("LLM_LITE_PATTERN", "lite") or "lite", re.I)
+GUARD_STREAM = (os.environ.get("LLM_GUARD_STREAM", "1").strip() != "0")   # validate agent turns even if PicoClaw asked for SSE
+try:
+    AGENT_TEMPERATURE = float((os.environ.get("LLM_AGENT_TEMPERATURE", "0.3") or "").strip())  # "" = leave as is
+except ValueError:
+    AGENT_TEMPERATURE = None
 WORKSPACE = os.environ.get("HERMES_WORKSPACE", "~/.picoclaw/workspace")
 SLOW_STATUS = {408, 504, 524}                 # backend already waited a long time
 RETRY_STATUS = {425, 429, 500, 502, 503}
@@ -113,6 +118,8 @@ def sse_to_chat_completion(raw_lines):
     model = ""
     comp_id = "chatcmpl-proxy"
     finish_reason = "stop"
+    seen_finish = False
+    seen_done = False
     usage = None
 
     def new_entry(tc, idx):
@@ -141,7 +148,10 @@ def sse_to_chat_completion(raw_lines):
         if not line.startswith("data:"):
             continue
         data_str = line[5:].strip()
-        if not data_str or data_str == "[DONE]":
+        if data_str == "[DONE]":
+            seen_done = True
+            continue
+        if not data_str:
             continue
         try:
             chunk = json.loads(data_str)
@@ -160,6 +170,7 @@ def sse_to_chat_completion(raw_lines):
         for choice in chunk.get("choices") or []:
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
+                seen_finish = True
             delta = choice.get("delta") or {}
             if delta.get("content"):
                 content_parts.append(delta["content"])
@@ -189,6 +200,8 @@ def sse_to_chat_completion(raw_lines):
                 if fn.get("arguments"):
                     entry["function"]["arguments"] += fn["arguments"]
 
+    if not seen_finish and not seen_done and (content_parts or tool_calls):
+        finish_reason = "incomplete_stream"      # connection died mid-reply: do NOT pass it on as a finished answer
     message = {"role": "assistant", "content": "".join(content_parts) or None}
     if reasoning_parts:
         message["reasoning_content"] = "".join(reasoning_parts)
@@ -271,6 +284,51 @@ def looks_stalled(content, last_role):
     return bool(_INTENT_RE.search(last_line)) or last_line.endswith((":", "…", "..."))
 
 
+_SENT_RE = re.compile(r"already been delivered to the user|sent to user", re.I)
+
+
+def _last_tool_text(msgs):
+    last = msgs[-1] if msgs and isinstance(msgs[-1], dict) else {}
+    c = last.get("content")
+    if isinstance(c, list):
+        c = " ".join(str(p.get("text", "")) for p in c if isinstance(p, dict))
+    return c if isinstance(c, str) else ""
+
+
+def _after_send_file(msgs):
+    return bool(_SENT_RE.search(_last_tool_text(msgs)))
+
+
+def _is_bare_confirmation(content):
+    """True for 'Requested output delivered via tool attachment.'-style replies: tiny, no explanation."""
+    return len(content.strip()) < 160
+
+
+# PicoClaw's send_file result says "provide only a brief confirmation". Models obey it and the user
+# gets a file with NO explanation. Replace that sentence (outgoing request only, history untouched).
+_BRIEF_RE = re.compile(r"If you reply, provide only a brief confirmation\.?", re.I)
+_EXPLAIN_INSTRUCTION = (
+    "Do not send the file again. Now write the explanation for the user, in the user's own language and "
+    "script: what it is and why it was needed (the cause or goal), what you did or changed as short points, "
+    "how you checked it and the real result, what is still untested or open, and how to use it. "
+    "Never reply with only a confirmation."
+)
+
+
+def rewrite_send_file_result(payload):
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list) or not msgs or not isinstance(msgs[-1], dict):
+        return False
+    last = msgs[-1]
+    if last.get("role") != "tool":
+        return False
+    c = last.get("content")
+    if isinstance(c, str) and _BRIEF_RE.search(c):
+        last["content"] = _BRIEF_RE.sub(_EXPLAIN_INSTRUCTION, c)
+        return True
+    return False
+
+
 def classify(comp, payload):
     """Return a reason string if the reply is bad, else None."""
     try:
@@ -278,6 +336,8 @@ def classify(comp, payload):
     except (KeyError, IndexError, TypeError):
         return "no_choices"
     msg = choice.get("message") or {}
+    if choice.get("finish_reason") == "incomplete_stream":
+        return "incomplete_stream"
     if msg.get("tool_calls"):
         reason = repair_tool_arguments(msg)
         if reason:
@@ -288,8 +348,12 @@ def classify(comp, payload):
     content = msg.get("content") or ""
     if not content.strip():
         return "empty"
+    if choice.get("finish_reason") == "length":
+        return "truncated_text"
     msgs = payload.get("messages") or []
     last_role = msgs[-1].get("role") if msgs and isinstance(msgs[-1], dict) else ""
+    if payload.get("tools") and last_role == "tool" and _after_send_file(msgs) and _is_bare_confirmation(content):
+        return "no_explanation"
     if payload.get("tools") and looks_stalled(content, last_role):
         return "stalled"
     return None
@@ -309,6 +373,16 @@ NUDGES = {
         "[hermes-guard] Your last tool call had invalid JSON arguments. Call the tool again with "
         "strictly valid JSON (double quotes, no comments, no trailing commas, escape newlines)."
     ),
+    "truncated_text": (
+        "[hermes-guard] Your last reply was cut off because it hit the output limit. Write the answer again, "
+        "shorter and complete (put long code in a file and only summarise it in chat)."
+    ),
+    "incomplete_stream": (
+        "[hermes-guard] Your last reply was cut off by a broken connection. Repeat it completely."
+    ),
+    "no_explanation": (
+        "[hermes-guard] The file was delivered, but you gave the user no explanation. " + _EXPLAIN_INSTRUCTION
+    ),
     "truncated_tool_call": (
         "[hermes-guard] Your last tool call was cut off because it was too long. Split the work into "
         "smaller steps (e.g. write a big file in several parts) and call the tool again."
@@ -321,7 +395,10 @@ def reminder_text(strong):
     base = (
         "[hermes-reminder] Finish EVERY part of the user's request: each thing they asked = one "
         "requirement. Do the work with tools instead of describing it. Verify with real output "
-        "before saying done. If you say you will do something, do it now with a tool call."
+        "before saying done. If you say you will do something, do it now with a tool call. "
+        "Give a correct, complete answer in the user's language; if facts may have changed, look them up "
+        "instead of guessing. If you changed or created anything, also explain why, what changed, how you "
+        "checked it and how to use it. A file or a bare 'done' alone is never an answer."
     )
     if not strong:
         return base
@@ -519,8 +596,10 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
 
         target_url = build_upstream_url(self.path)
         try:
-            if payload is not None and is_chat and not client_wants_stream:
-                self._guarded_chat(target_url, payload)
+            if payload is not None and is_chat and (
+                not client_wants_stream or (GUARD and GUARD_STREAM and payload.get("tools"))
+            ):
+                self._guarded_chat(target_url, payload, as_stream=client_wants_stream)
                 return
             if payload is not None and is_chat:
                 payload["stream"] = True
@@ -557,10 +636,44 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    def _guarded_chat(self, target_url, payload):
+    def _send_sse(self, comp):
+        """Re-emit a validated chat.completion as an SSE stream for clients that asked for stream=true."""
+        choice = comp["choices"][0]
+        msg = choice.get("message") or {}
+        base = {"id": comp.get("id", "chatcmpl-proxy"), "object": "chat.completion.chunk", "model": comp.get("model", "")}
+        chunks = [dict(base, choices=[{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}])]
+        if msg.get("reasoning_content"):
+            chunks.append(dict(base, choices=[{"index": 0, "delta": {"reasoning_content": msg["reasoning_content"]}, "finish_reason": None}]))
+        text = msg.get("content") or ""
+        for i in range(0, len(text), 400):
+            chunks.append(dict(base, choices=[{"index": 0, "delta": {"content": text[i:i + 400]}, "finish_reason": None}]))
+        for i, tc in enumerate(msg.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            chunks.append(dict(base, choices=[{"index": 0, "delta": {"tool_calls": [{
+                "index": i, "id": tc.get("id"), "type": "function",
+                "function": {"name": fn.get("name", ""), "arguments": fn.get("arguments", "")}}]}, "finish_reason": None}]))
+        chunks.append(dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason") or "stop"}]))
+        if comp.get("usage"):
+            chunks.append(dict(base, choices=[], usage=comp["usage"]))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        for ch in chunks:
+            self.wfile.write(f"data: {json.dumps(ch, ensure_ascii=False)}\n\n".encode("utf-8"))
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    def _guarded_chat(self, target_url, payload, as_stream=False):
         payload["stream"] = True
         agent_turn = bool(payload.get("tools"))
         guard_on = GUARD and agent_turn
+        if guard_on:
+            if AGENT_TEMPERATURE is not None and "temperature" in payload:
+                payload["temperature"] = AGENT_TEMPERATURE     # tool JSON + code want low randomness
+            if rewrite_send_file_result(payload):
+                log("send_file result rewritten: model must explain, not just confirm")
         with _state_lock:
             prev_lite = bool(LITE_RE.search(_state["last_model"] or ""))
             prev_bad = _state["last_was_bad"]
@@ -592,6 +705,14 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
             if comp is None:                      # upstream error / non-completion: pass it on
                 self._send_raw(resp, raw)
                 return
+            def _deliver(c):
+                ch0 = (c.get("choices") or [{}])[0]
+                if ch0.get("finish_reason") == "incomplete_stream":
+                    ch0["finish_reason"] = "length"       # retries used up: tell PicoClaw it is cut, not finished
+                if as_stream:
+                    self._send_sse(c)
+                else:
+                    self._send_json(200, c)
 
             model = comp.get("model") or ""
             reason = classify(comp, payload) if guard_on else None
@@ -617,7 +738,7 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
                 and reason != "no_choices"
             )
             if not can_retry:
-                self._send_json(200, comp)
+                _deliver(comp)
                 return
             semantic_retries += 1
             stall_retried = stall_retried or reason == "stalled"

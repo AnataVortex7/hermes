@@ -103,7 +103,8 @@ class Upstream(BaseHTTPRequestHandler):
             self.end_headers()
             for ch in val:
                 self.wfile.write(f"data: {json.dumps(ch)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
+            if kind != "sse_nodone":          # connection dropped: no finish_reason, no [DONE]
+                self.wfile.write(b"data: [DONE]\n\n")
 
 
 def free_port():
@@ -293,6 +294,59 @@ class ProxyTests(unittest.TestCase):
         _, raw = self.call(self.msg(), stream=True)
         self.assertIn(b"data:", raw)
         self.assertIn(b"[DONE]", raw)
+
+    # ---- v2 fixes: explanation after send_file, cut-off text, guarded streaming
+    SENT = ("File \"x.py\" sent to user\nThe requested output has already been delivered to the user in the current "
+            "chat. Do not call send_file or any other delivery tool again. If you reply, provide only a brief confirmation.")
+
+    def test_send_file_result_is_rewritten_so_model_must_explain(self):
+        SCRIPT.append(sse(*text_chunks("Root cause: X. Changed: Y. Tested: Z. Run: python x.py " + "a" * 200)))
+        self.call([{"role": "user", "content": "fix"}, {"role": "tool", "content": self.SENT, "tool_call_id": "1"}])
+        sent = SEEN[0]["messages"][-1]["content"]
+        self.assertNotIn("only a brief confirmation", sent)
+        self.assertIn("explanation", sent.lower())
+
+    def test_bare_confirmation_after_send_file_is_retried(self):
+        SCRIPT.extend([sse(*text_chunks("Requested output delivered via tool attachment.")),
+                       sse(*text_chunks("Root cause: URL had literal ${e}. Changed: ... " + "b" * 200))])
+        _, raw = self.call([{"role": "tool", "content": self.SENT, "tool_call_id": "1"}])
+        self.assertEqual(len(SEEN), 2)
+        self.assertIn("no explanation", SEEN[1]["messages"][-1]["content"])
+        self.assertIn("Root cause", json.loads(raw)["choices"][0]["message"]["content"])
+
+    def test_text_cut_by_max_tokens_is_retried(self):
+        SCRIPT.extend([sse(*[{"model": "m", "choices": [{"delta": {"content": "half an ans"}, "finish_reason": "length"}]}]),
+                       sse(*text_chunks("Full short answer."))])
+        _, raw = self.call(self.msg())
+        self.assertEqual(len(SEEN), 2)
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "Full short answer.")
+
+    def test_stream_dropped_without_finish_is_retried(self):
+        SCRIPT.extend([("sse_nodone", [{"model": "m", "choices": [{"delta": {"content": "par"}}]}]),
+                       sse(*text_chunks("complete answer"))])
+        _, raw = self.call(self.msg())
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "complete answer")
+
+    def test_streaming_client_with_tools_is_validated_and_re_emitted(self):
+        SCRIPT.extend([sse(*text_chunks("")),     # empty -> must be retried even though client wants stream
+                       sse(*tool_chunks([(0, "c1", "exec", '{"cmd":"ls"}')]))])
+        _, raw = self.call(self.msg(), stream=True)
+        self.assertEqual(len(SEEN), 2)
+        text = raw.decode()
+        self.assertIn("[DONE]", text)
+        chunks = [json.loads(l[5:]) for l in text.splitlines() if l.startswith("data:") and "[DONE]" not in l]
+        tcs = [c["choices"][0]["delta"]["tool_calls"][0] for c in chunks if c["choices"] and c["choices"][0]["delta"].get("tool_calls")]
+        self.assertEqual(tcs[0]["function"]["name"], "exec")
+        self.assertEqual(json.loads(tcs[0]["function"]["arguments"]), {"cmd": "ls"})
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "tool_calls")
+
+    def test_agent_temperature_is_lowered(self):
+        SCRIPT.append(sse(*text_chunks("ok ✅")))
+        body = {"model": "x", "temperature": 0.7, "stream": False, "messages": self.msg(),
+                "tools": [{"type": "function", "function": {"name": "exec", "parameters": {}}}]}
+        req = urllib.request.Request(self.url, json.dumps(body).encode(), {"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=20).read()
+        self.assertEqual(SEEN[0]["temperature"], 0.3)
 
     def test_upstream_error_is_passed_through_after_retries(self):
         SCRIPT.extend([("status", 500)] * 4)

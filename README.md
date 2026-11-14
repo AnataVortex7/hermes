@@ -126,3 +126,10 @@ of your API, not a PicoClaw timer. If one call to a slow model (e.g. 184 s) send
 the client with 504 while the backend keeps working and later logs 200. Real fix is in the API: open the SSE
 response immediately and send a comment line (`: keepalive` + blank line) every ~15 s until the model answers.
 The proxy ignores comment lines, so this is safe. By default the proxy waits the full 10 minutes (600 s) without cutting silent calls at 90 s or sending duplicate retries.
+
+## v2 guard fixes (explanations, cut-off replies, streaming)
+- **send_file explanation**: PicoClaw's `send_file` result tells the model "provide only a brief confirmation", so the user got a file and no explanation. The proxy now rewrites that sentence in the outgoing request and retries a bare "delivered" reply (`reason=no_explanation`). USER.md section 4 also tells the model to send the explanation with `message` *before* `send_file`.
+- **Cut-off replies**: text that ends with `finish_reason=length` (`truncated_text`) and streams that die without `finish_reason`/`[DONE]` (`incomplete_stream`) are retried instead of being delivered as if complete.
+- **Streaming bypass**: agent requests (with `tools`) are validated even when PicoClaw asks for `stream=true` (Telegram streaming); the validated reply is re-emitted as SSE. `LLM_GUARD_STREAM=0` turns this off.
+- **Temperature**: agent turns use `LLM_AGENT_TEMPERATURE` (default `0.3`; empty = leave PicoClaw's value) for more reliable tool JSON.
+- Check in Koyeb logs: agent turns must print `[guard] model=... reason=ok`. If they do not, the guard was being bypassed.
