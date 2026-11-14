@@ -14,6 +14,8 @@ import urllib.request
 
 
 def send(token: str, chat_id: str, text: str) -> bool:
+    if len(text) > 4000:
+        text = text[:900] + "\n... [truncated] ...\n" + text[-2900:]
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})

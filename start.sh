@@ -4,6 +4,8 @@ export TZ="Asia/Kolkata"
 
 echo "=== [PicoW Clow Koyeb Instant Startup & Background Sync] ==="
 
+rm -f /tmp/shutting_down /tmp/restore.log /tmp/setup_picoclaw.log /tmp/picoclaw.log /tmp/stream_proxy.log
+
 # 1. START KEEP-ALIVE SERVER INSTANTLY
 if [ -f /app/keep_alive.py ]; then
   echo ">> Starting keep-alive HTTP server immediately..."
@@ -12,6 +14,38 @@ fi
 
 BOOT_TS=$(date +%s)
 notify() { python3 /app/notify.py "$1" >/dev/null 2>&1 || true; }
+
+run_logged() {
+  local logfile="$1"
+  shift
+  "$@" > "$logfile" 2>&1
+  local rc=$?
+  cat "$logfile"
+  return $rc
+}
+
+collect_error_logs() {
+  python3 - <<'PY' 2>/dev/null
+from pathlib import Path
+
+sections = [
+    ("picoclaw gateway", "/tmp/picoclaw.log", 35),
+    ("setup_picoclaw.py", "/tmp/setup_picoclaw.log", 20),
+    ("llm_proxy.py", "/tmp/stream_proxy.log", 15),
+    ("rclone restore", "/tmp/restore.log", 15),
+]
+out = []
+for title, path, nlines in sections:
+    p = Path(path)
+    if p.is_file():
+        lines = [ln for ln in p.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+        if lines:
+            tail = "\n".join(lines[-nlines:])
+            out.append(f"--- {title} ---\n{tail}")
+print("\n\n".join(out) if out else "(कोणताही error log सापडला नाही)")
+PY
+}
+
 if [ "${NOTIFY_ON_BOOT:-1}" = "1" ]; then
   notify "🔄 Server restart झाला. Google Drive वरून history restore सुरू आहे...
 PicoClaw अजून start केलेला नाही - restore पूर्ण झाल्यावर 'ready' message येईल, तोपर्यंत message पाठवू नका."
@@ -91,6 +125,9 @@ picoclaw_sync() {
     --exclude "config.json" \
     --exclude ".security.yml" \
     --exclude "*.log" \
+    --exclude "*.pid" \
+    --exclude "*.lock" \
+    --exclude "*.sock" \
     --exclude "cache/**"
 }
 
@@ -115,13 +152,17 @@ if [ -f ~/.config/rclone/rclone.conf ]; then
     echo ">> Restore attempt $ATTEMPT from Google Drive ($REMOTE_BACKUP)..."
     rclone mkdir "$REMOTE_BACKUP" 2>/dev/null || true
     rclone mkdir "$PICOCLAW_REMOTE" 2>/dev/null || true
-    if rclone_sync sync "$REMOTE_BACKUP" ~/.picow_clow/ --drive-chunk-size 8M --exclude "picoclaw/**" \
-       && picoclaw_sync sync "$PICOCLAW_REMOTE" ~/.picoclaw/ --drive-chunk-size 8M; then
+    : > /tmp/restore.log
+    if rclone_sync sync "$REMOTE_BACKUP" ~/.picow_clow/ --drive-chunk-size 8M --exclude "picoclaw/**" >> /tmp/restore.log 2>&1 \
+       && picoclaw_sync sync "$PICOCLAW_REMOTE" ~/.picoclaw/ --drive-chunk-size 8M >> /tmp/restore.log 2>&1; then
+      cat /tmp/restore.log
       SYNC_SAFE=1; RESTORE_OK=1
       RESTORE_SECS=$(( $(date +%s) - RESTORE_START ))
       echo ">> Restore OK (${RESTORE_SECS}s)."
       break
     fi
+    cat /tmp/restore.log
+    RESTORE_ERR=$(tail -n 25 /tmp/restore.log 2>/dev/null)
     echo ">> Restore FAILED (attempt $ATTEMPT)."
     if [ "${RESTORE_MAX_ATTEMPTS:-2}" -gt 0 ] && [ "$ATTEMPT" -ge "${RESTORE_MAX_ATTEMPTS:-2}" ] \
        && [ "${ALLOW_START_WITHOUT_RESTORE:-1}" = "1" ]; then
@@ -131,10 +172,16 @@ if [ -f ~/.config/rclone/rclone.conf ]; then
       mkdir -p ~/.picow_clow ~/.picoclaw
       CLEAN_START=1
       notify "🧹 Restore $ATTEMPT वेळा फेल झाला, म्हणून PicoClaw CLEAN history ने start होतोय (जुनी history या वेळी नाही).
-⚠️ Drive वरचा जुना backup सुरक्षित ठेवण्यासाठी या run चा Drive sync बंद आहे. Drive ठीक झाल्यावर Koyeb मध्ये redeploy/restart केला की जुनी history परत येईल."
+⚠️ Drive वरचा जुना backup सुरक्षित ठेवण्यासाठी या run चा Drive sync बंद आहे. Drive ठीक झाल्यावर Koyeb मध्ये redeploy/restart केला की जुनी history परत येईल.
+
+📋 Error Log:
+${RESTORE_ERR:-(कोणताही error log सापडला नाही)}"
       break
     fi
-    [ "$ATTEMPT" = "1" ] && notify "⚠️ Drive restore फेल झाला (attempt 1). PicoClaw अजून start केलेला नाही, परत प्रयत्न करतोय..."
+    [ "$ATTEMPT" = "1" ] && notify "⚠️ Drive restore फेल झाला (attempt 1). PicoClaw अजून start केलेला नाही, परत प्रयत्न करतोय...
+
+📋 Error Log:
+${RESTORE_ERR:-(कोणताही error log सापडला नाही)}"
     sleep 20
   done
 else
@@ -179,9 +226,12 @@ SYNC_PID=$!
 
 # 5. Trap for graceful shutdown
 APP_PID=""
+TAIL_PID=""
 cleanup() {
   trap - SIGTERM SIGINT EXIT
+  touch /tmp/shutting_down
   echo ">> Container shutting down. Performing final sync..."
+  [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null || true
   [ -n "$APP_PID" ] && kill "$APP_PID" 2>/dev/null || true
   kill $SYNC_PID 2>/dev/null || true
   sync_to_cloud
@@ -190,22 +240,27 @@ cleanup() {
 trap cleanup SIGTERM SIGINT EXIT
 
 # 6. Start PicoClaw gateway (Telegram long-polling, no inbound port needed)
-if command -v picoclaw >/dev/null 2>&1 && python3 /app/setup_picoclaw.py; then
+if command -v picoclaw >/dev/null 2>&1 && run_logged /tmp/setup_picoclaw.log python3 /app/setup_picoclaw.py; then
   echo ">> Starting PicoClaw gateway (Telegram)..."
-  picoclaw gateway &
+  : > /tmp/picoclaw.log
+  tail -n +1 -f /tmp/picoclaw.log &
+  TAIL_PID=$!
+  picoclaw gateway >> /tmp/picoclaw.log 2>&1 &
   APP_PID=$!
 
-  # Tell the owner on Telegram when PicoClaw is really up (gateway /ready == 200).
-  (
-    HP="${PICOCLAW_HEALTH_PORT:-18790}"
-    READY=0
-    for _ in $(seq 1 120); do
-      kill -0 "$APP_PID" 2>/dev/null || break
-      if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HP/ready" 2>/dev/null)" = "200" ]; then
-        READY=1; break
-      fi
-      sleep 1
-    done
+  # Wait up to 120s in the main shell to verify PicoClaw is up (gateway /ready == 200) or detect early crash.
+  HP="${PICOCLAW_HEALTH_PORT:-18790}"
+  READY=0
+  for _ in $(seq 1 120); do
+    [ -f /tmp/shutting_down ] && break
+    kill -0 "$APP_PID" 2>/dev/null || break
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HP/ready" 2>/dev/null)" = "200" ]; then
+      READY=1; break
+    fi
+    sleep 1
+  done
+
+  if [ ! -f /tmp/shutting_down ]; then
     TOTAL=$(( $(date +%s) - BOOT_TS ))
     JOBS=$(python3 - <<'PY' 2>/dev/null
 import json, os
@@ -228,13 +283,37 @@ PY
     elif [ "$READY" = "1" ]; then
       notify "⚠️ PicoClaw चालू आहे, पण Drive restore पूर्ण नाही झाला. (${TOTAL}s)"
     elif kill -0 "$APP_PID" 2>/dev/null; then
-      notify "⚠️ PicoClaw process चालू आहे पण /ready check 120s मध्ये आला नाही. Koyeb logs बघा. (Restore: $([ "$RESTORE_OK" = "1" ] && echo OK || echo NOT-OK))"
+      ERR_LOG=$(collect_error_logs)
+      notify "⚠️ PicoClaw process चालू आहे पण /ready check 120s मध्ये आला नाही. (Restore: $([ "$RESTORE_OK" = "1" ] && echo OK || echo NOT-OK))
+
+📋 Error Log:
+${ERR_LOG}"
     else
-      notify "❌ PicoClaw start होताच बंद पडला. Koyeb logs तपासा."
+      wait "$APP_PID" 2>/dev/null
+      EXIT_CODE=$?
+      sleep 1
+      ERR_LOG=$(collect_error_logs)
+      echo ">> PicoClaw exited on startup with code $EXIT_CODE"
+      notify "❌ PicoClaw start होताच बंद पडला (exit code: ${EXIT_CODE}).
+
+📋 Error Log:
+${ERR_LOG}"
+      sleep infinity
     fi
-  ) &
+  fi
 
   wait "$APP_PID"
+  EXIT_CODE=$?
+  if [ ! -f /tmp/shutting_down ]; then
+    sleep 1
+    ERR_LOG=$(collect_error_logs)
+    echo ">> PicoClaw exited unexpectedly with code $EXIT_CODE"
+    notify "❌ PicoClaw अचानक बंद पडला (exit code: ${EXIT_CODE}).
+
+📋 Error Log:
+${ERR_LOG}"
+    sleep infinity
+  fi
 elif [ -f /app/main.py ]; then
   echo ">> Starting main.py..."
   python3 /app/main.py
@@ -242,7 +321,14 @@ elif [ -f /app/app.py ]; then
   echo ">> Starting app.py..."
   python3 /app/app.py
 else
+  if ! command -v picoclaw >/dev/null 2>&1; then
+    echo "picoclaw binary not found in PATH ($PATH)" >> /tmp/setup_picoclaw.log
+  fi
+  ERR_LOG=$(collect_error_logs)
   echo ">> PicoClaw not started (check TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOW_FROM / LLM_API_KEY). Keeping container alive..."
-  notify "❌ PicoClaw start झाला नाही (setup फेल). TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOW_FROM / LLM_API_KEY तपासा. Restore: $([ "$RESTORE_OK" = "1" ] && echo OK || echo NOT-OK)"
+  notify "❌ PicoClaw start झाला नाही (setup फेल). TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOW_FROM / LLM_API_KEY तपासा. Restore: $([ "$RESTORE_OK" = "1" ] && echo OK || echo NOT-OK)
+
+📋 Error Log:
+${ERR_LOG}"
   sleep infinity
 fi

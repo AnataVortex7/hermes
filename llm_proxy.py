@@ -633,12 +633,14 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
 
 def main():
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), GuardProxyHandler)
-    print(
+    banner = (
         f"LLM guard proxy listening on http://{LISTEN_HOST}:{LISTEN_PORT} -> {UPSTREAM_BASE} "
         f"(guard={'on' if GUARD else 'off'}, reminder={'on' if REMINDER else 'off'}, "
-        f"first_byte={FIRST_BYTE_TIMEOUT:g}s, idle={STREAM_IDLE_TIMEOUT:g}s)",
-        flush=True,
+        f"first_byte={FIRST_BYTE_TIMEOUT:g}s, idle={STREAM_IDLE_TIMEOUT:g}s, "
+        f"timeout={TIMEOUT}s, timeout_retries={TIMEOUT_RETRIES})"
     )
+    print(banner, flush=True)
+    log(banner)
     server.serve_forever()
 
 
