@@ -6,214 +6,6 @@ import sys
 import time
 from pathlib import Path
 
-STREAM_PROXY_CODE = r'''import http.client
-import json
-import os
-import sys
-import urllib.parse
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-UPSTREAM_BASE = os.environ.get("PICOCLAW_UPSTREAM_API_BASE", "https://api.openai.com/v1").rstrip("/")
-LISTEN_HOST = "127.0.0.1"
-LISTEN_PORT = int(os.environ.get("LOCAL_LLM_PROXY_PORT", "18799"))
-TIMEOUT = int(os.environ.get("LLM_REQUEST_TIMEOUT", "600"))
-
-
-def build_upstream_url(req_path: str) -> str:
-    parsed_base = urllib.parse.urlparse(UPSTREAM_BASE)
-    base_path = parsed_base.path.rstrip("/")
-    if base_path.endswith("/v1") and req_path.startswith("/v1/"):
-        req_path = req_path[3:]
-    elif base_path.endswith("/v1") and req_path == "/v1":
-        req_path = ""
-    return f"{UPSTREAM_BASE}{req_path}"
-
-
-def sse_to_chat_completion(raw_lines):
-    content_parts = []
-    reasoning_parts = []
-    tool_calls = {}
-    model = ""
-    comp_id = "chatcmpl-proxy"
-    finish_reason = "stop"
-    usage = None
-
-    for raw in raw_lines:
-        line = raw.decode("utf-8", errors="replace").strip()
-        if not line.startswith("data:"):
-            continue
-        data_str = line[5:].strip()
-        if not data_str or data_str == "[DONE]":
-            continue
-        try:
-            chunk = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
-
-        if chunk.get("id"):
-            comp_id = chunk["id"]
-        if chunk.get("model"):
-            model = chunk["model"]
-        if chunk.get("usage"):
-            usage = chunk["usage"]
-
-        for choice in chunk.get("choices") or []:
-            if choice.get("finish_reason"):
-                finish_reason = choice["finish_reason"]
-            delta = choice.get("delta") or {}
-            if delta.get("content"):
-                content_parts.append(delta["content"])
-            if delta.get("reasoning_content"):
-                reasoning_parts.append(delta["reasoning_content"])
-            for tc in delta.get("tool_calls") or []:
-                idx = tc.get("index", 0)
-                entry = tool_calls.setdefault(
-                    idx,
-                    {
-                        "id": tc.get("id") or f"call_{idx}",
-                        "type": tc.get("type") or "function",
-                        "function": {"name": "", "arguments": ""},
-                    },
-                )
-                if tc.get("id"):
-                    entry["id"] = tc["id"]
-                fn = tc.get("function") or {}
-                if fn.get("name"):
-                    entry["function"]["name"] += fn["name"]
-                if fn.get("arguments"):
-                    entry["function"]["arguments"] += fn["arguments"]
-
-    message = {"role": "assistant", "content": "".join(content_parts) or None}
-    if reasoning_parts:
-        message["reasoning_content"] = "".join(reasoning_parts)
-    if tool_calls:
-        message["tool_calls"] = [tool_calls[k] for k in sorted(tool_calls)]
-        if finish_reason == "stop":
-            finish_reason = "tool_calls"
-
-    result = {
-        "id": comp_id,
-        "object": "chat.completion",
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": finish_reason,
-            }
-        ],
-    }
-    if usage:
-        result["usage"] = usage
-    return result
-
-
-class LiveStreamProxyHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, fmt, *args):
-        sys.stderr.write(f"[stream_proxy] {fmt % args}\n")
-        sys.stderr.flush()
-
-    def _handle_request(self):
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        body = self.rfile.read(length) if length > 0 else b""
-
-        client_wants_stream = False
-        if body and "json" in (self.headers.get("Content-Type") or "").lower():
-            try:
-                payload = json.loads(body.decode("utf-8"))
-                if isinstance(payload, dict):
-                    client_wants_stream = bool(payload.get("stream", False))
-                    if self.path.rstrip("/").endswith("/chat/completions"):
-                        payload["stream"] = True
-                        body = json.dumps(payload).encode("utf-8")
-            except Exception:
-                pass
-
-        target_url = build_upstream_url(self.path)
-        parsed = urllib.parse.urlparse(target_url)
-        conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        upstream_path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
-
-        fwd_headers = {}
-        for k, v in self.headers.items():
-            kl = k.lower()
-            if kl in ("host", "content-length", "accept-encoding", "connection"):
-                continue
-            fwd_headers[k] = v
-        if body:
-            fwd_headers["Content-Length"] = str(len(body))
-
-        conn = None
-        try:
-            conn = conn_cls(parsed.hostname, port, timeout=TIMEOUT)
-            conn.request(self.command, upstream_path, body=body if body else None, headers=fwd_headers)
-            resp = conn.getresponse()
-            ctype = (resp.getheader("Content-Type") or "").lower()
-
-            if resp.status == 200 and "text/event-stream" in ctype:
-                if client_wants_stream:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                    self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    while True:
-                        line = resp.readline()
-                        if not line:
-                            break
-                        self.wfile.write(line)
-                        self.wfile.flush()
-                else:
-                    lines = []
-                    while True:
-                        line = resp.readline()
-                        if not line:
-                            break
-                        lines.append(line)
-                    out = json.dumps(sse_to_chat_completion(lines)).encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(out)))
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    self.wfile.write(out)
-            else:
-                raw = resp.read()
-                self.send_response(resp.status)
-                self.send_header("Content-Type", resp.getheader("Content-Type") or "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(raw)
-        except Exception as exc:
-            err = json.dumps({"error": {"message": f"stream_proxy error: {exc}"}}).encode("utf-8")
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(err)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(err)
-        finally:
-            if conn:
-                conn.close()
-
-    def do_GET(self):
-        self._handle_request()
-
-    def do_POST(self):
-        self._handle_request()
-
-
-if __name__ == "__main__":
-    server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), LiveStreamProxyHandler)
-    print(f"Live stream proxy listening on http://{LISTEN_HOST}:{LISTEN_PORT} -> {UPSTREAM_BASE}", flush=True)
-    server.serve_forever()
-'''
-
-
 BLOCK_START = "<!-- HERMES-PERMISSIONS:START (auto-generated on every boot, do not edit) -->"
 BLOCK_END = "<!-- HERMES-PERMISSIONS:END -->"
 PERMISSION_NOTES = f"""{BLOCK_START}
@@ -227,41 +19,72 @@ only report back when it works or when you are truly blocked (then show the exac
 
 - `exec` is fully enabled: no deny patterns, no workspace restriction, remote (Telegram) allowed.
 - `cron` tool: `action=add` with `command="..."` works from this Telegram chat. Use
-  `every_seconds` / `at_seconds` / `cron_expr`. Do NOT pass the user a "restricted" excuse.
-  The command's output is posted automatically to the SAME Telegram chat; no active session
-  or notification permission is needed. Verify with `cron action=list`.
-- Complete the whole job in one go (install -> write script -> test run -> schedule) without
-  asking for confirmation at each step.
-- Python packages: `pip install <pkg>` (or `python3 -m pip install`) is persistent - it is stored
-  in ~/.picow_clow/pyuser and restored from Google Drive on every restart. `requests` and
-  `beautifulsoup4` are already installed. apt/npm -g installs are replayed on boot too.
-- Put scripts you want to keep in the workspace ({{WORKSPACE}}/scripts/). Anything outside
-  ~/.picoclaw and ~/.picow_clow (e.g. /tmp, /app) is LOST on restart. Cron jobs are saved
-  in the workspace and survive restarts.
+  `every_seconds` / `at_seconds` / `cron_expr`. The command's output is posted automatically
+  to the SAME Telegram chat. Verify with `cron action=list`.
+- Python packages: `pip install <pkg>` is persistent (stored in ~/.picow_clow/pyuser and restored
+  from Google Drive on every restart). `requests` and `beautifulsoup4` are already installed.
+  apt/npm -g installs are replayed on boot too.
+- Keep scripts in {{WORKSPACE}}/scripts/. Anything outside ~/.picoclaw and ~/.picow_clow
+  (e.g. /tmp, /app) is LOST on restart. Cron jobs are saved in the workspace and survive restarts.
+- Full permission is for getting the job done: never delete the workspace, ~/.picoclaw,
+  ~/.picow_clow or the user's data unless explicitly asked.
 
-## How you work (always follow this)
+## OPERATING PROTOCOL (authoritative - follow it on every task)
 
-1. THINK FIRST. Before acting, restate the goal in one line and plan the steps. For a bug or
-   error, find the ROOT CAUSE (read the exact error, logs, the file/config involved) instead
-   of guessing or retrying the same thing.
-2. DO IT YOURSELF. Use `exec`, file tools, `cron`, pip/apt/npm to actually do the work. Do not
-   give the user a list of manual steps if you can run them. Never say "I can't" or "restricted"
-   before you have tried and seen a real error.
-3. FIX CODE PROPERLY. When code or a script fails: read it, change the minimal thing that fixes
-   the cause, save it, and run it again. Repeat until it works. Do not hand over untested code.
-4. TEST EVERYTHING before reporting success:
-   - run the script once manually and check the real output (exit code + stdout/stderr);
-   - for cron: `cron action=list` to confirm it exists, and, if possible, a short test job
-     (e.g. every_seconds=60) to prove the output reaches this chat, then set the real schedule
-     and remove the test job;
-   - for installs: import the package / run `--version` to confirm.
-5. HANDLE FAILURES. If a test fails, go back to step 1 with the new error. Try a different
-   approach after 2 identical failures. Only stop when it works, or when you are truly blocked
-   (missing token, site down, etc.) - then show the exact error and what you already tried.
-6. REPORT BRIEFLY. Final message: what was done, what you tested and the result, and where files
-   live. No long apologies, no repeated questions. Reply in the same language the user writes in.
-7. STAY SAFE ON THE DATA. Full permission is for getting the job done: do not delete the
-   workspace, ~/.picoclaw, ~/.picow_clow or the user's data unless explicitly asked.
+The model answering you can CHANGE between turns (several models take turns), so nothing lives
+"in your head": the plan and progress live in the file {{WORKSPACE}}/tasks/current.md.
+
+### A. Start of every turn
+1. If {{WORKSPACE}}/tasks/current.md exists and its Status is not DONE, read it FIRST. It is the
+   plan of a job that another model may have started. Continue it; do not restart or re-ask.
+2. Read the user's whole message. Split it into REQUIREMENTS: every thing asked, every constraint
+   ("don't skip anything", "automatic", "like X"), every result expected. Add the implicit ones:
+   it must really run, it must survive a restart, it must be tested.
+
+### B. Plan (jobs with more than 2 steps; plain questions and tiny jobs do not need the file)
+Write/update {{WORKSPACE}}/tasks/current.md (move an old finished one to tasks/done/ first):
+    # Task: <one-line goal>
+    Status: IN-PROGRESS
+    ## Requirements   (R1, R2, ... each checkable, in the user's own words)
+    - [ ] R1 ...
+    ## Plan           (ordered steps)
+    ## Log            (one line per finished step: what you ran + the real result)
+    ## Assumptions
+Then work through the plan step by step and update the file after EACH step (tick the box, add the
+evidence). If the user adds or changes something, add new R-lines; never silently drop old ones.
+
+### C. Doing the work
+- Act with tools. Never end a turn with a plan, a promise or "now I will ..." - do it in the same turn.
+- Do not skip, merge, shorten or postpone anything. No placeholders (TODO, "...", "rest is the same").
+  Write complete files and complete commands.
+- Understand before you change: read the existing file / config / log first. Make the smallest correct
+  change; do not rewrite things that already work.
+- Unclear request: first try to resolve it by looking (files, logs, memory). If two readings would give
+  different results and looking does not decide, ask ONE short question; otherwise pick the most likely
+  reading, write it under Assumptions and continue.
+- Big jobs: write big files in several smaller steps. If you run low on tool steps, save the state in
+  current.md and tell the user exactly which R-items remain; they will say "continue".
+- Tool arguments must be strictly valid JSON.
+
+### D. When something fails (root cause, no guessing)
+1. Reproduce it and copy the exact error.  2. Name 2-3 likely causes, most likely first.
+3. Test the cheapest one with a command.  4. Fix the cause.  5. Re-run the SAME test, then one
+neighbouring check for regressions. After 2 identical failures change the approach. Never retry blindly.
+
+### E. Definition of DONE (gate - pass it before the final message)
+- Walk through the Requirements one by one. Each needs [x] AND evidence (command output, file content,
+  `cron action=list`). Any [ ] left means: keep working.
+- Run it for real. "should work" / "I think" is not evidence; you need the exit code and expected output.
+- Only then set "Status: DONE" in current.md.
+
+### F. Final message
+Short, in the user's language: for each Rn -> done / not done -> one-line evidence; then where the files
+are and what is still open. Be honest about anything untested or not done. No long apologies.
+
+### G. Language & style
+Reply in the same language AND script the user writes (Roman Marathi -> Roman Marathi, Devanagari ->
+Devanagari). Keep the words short, but "short" is only about wording, never about the amount of work:
+if AGENT.md or SOUL.md say "concise" or "fast", that never means skipping steps.
 {BLOCK_END}
 """
 
@@ -269,6 +92,7 @@ only report back when it works or when you are truly blocked (then show the exac
 def write_permission_notes(workspace: Path) -> None:
     """Idempotently (re)write the permissions block in USER.md, keeping the rest of the file."""
     (workspace / "scripts").mkdir(parents=True, exist_ok=True)
+    (workspace / "tasks" / "done").mkdir(parents=True, exist_ok=True)  # task ledger, survives model switches
     block = PERMISSION_NOTES.replace("{WORKSPACE}", str(workspace))
     user_md = workspace / "USER.md"
     existing = user_md.read_text(encoding="utf-8") if user_md.exists() else ""
@@ -344,20 +168,21 @@ def main() -> None:
     except ValueError:
         proxy_port = 18799
 
-    proxy_script = picoclaw_home / "stream_proxy.py"
-    proxy_script.write_text(STREAM_PROXY_CODE, encoding="utf-8")
-    proxy_log = open("/tmp/stream_proxy.log", "a", encoding="utf-8")
+    # llm_proxy.py lives next to this script (/app in the image).
+    proxy_script = Path(__file__).resolve().with_name("llm_proxy.py")
+    if not proxy_script.is_file():
+        print(f"Error: {proxy_script} is missing (COPY llm_proxy.py in the Dockerfile).", file=sys.stderr)
+        sys.exit(1)
 
     proxy_env = os.environ.copy()
     proxy_env["PICOCLAW_UPSTREAM_API_BASE"] = upstream_base
     proxy_env["LOCAL_LLM_PROXY_PORT"] = str(proxy_port)
     proxy_env["LLM_REQUEST_TIMEOUT"] = str(request_timeout)
+    proxy_env["HERMES_WORKSPACE"] = workspace
 
     subprocess.Popen(
         [sys.executable, str(proxy_script)],
-        env=proxy_env,
-        stdout=proxy_log,
-        stderr=proxy_log,
+        env=proxy_env,          # stdout/stderr inherited -> `[guard] model=...` lines show up in Koyeb logs
         start_new_session=True,
     )
 
@@ -372,6 +197,19 @@ def main() -> None:
         "api_base": f"http://127.0.0.1:{proxy_port}/v1",
         "request_timeout": request_timeout,
     }
+
+    # Optional: extra JSON fields sent with every request to your custom API, e.g.
+    #   LLM_EXTRA_BODY={"reasoning_effort":"high"}
+    # (PicoClaw's own `thinking_level` is NOT forwarded to generic OpenAI-compatible endpoints.)
+    extra_body_raw = os.environ.get("LLM_EXTRA_BODY", "").strip()
+    if extra_body_raw:
+        try:
+            extra_body = json.loads(extra_body_raw)
+            if not isinstance(extra_body, dict):
+                raise ValueError("must be a JSON object")
+            model_entry["extra_body"] = extra_body
+        except ValueError as exc:
+            print(f"Warning: LLM_EXTRA_BODY ignored ({exc})", file=sys.stderr)
 
     def env_int(name: str, default: int) -> int:
         try:
@@ -401,7 +239,7 @@ def main() -> None:
                 "restrict_to_workspace": False,
                 "allow_read_outside_workspace": True,
                 # let the agent finish multi-step jobs (install -> write script -> cron.add)
-                "max_tool_iterations": 50,
+                "max_tool_iterations": env_int("LLM_MAX_TOOL_ITERATIONS", 100),
                 # sub-agents (default 5 min) get the same >=10 min
                 "subturn": {"default_timeout_minutes": MIN_TIMEOUT // 60},
                 "context_window": context_window,
@@ -453,7 +291,8 @@ def main() -> None:
     config_path = picoclaw_home / "config.json"
     config_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     print(f"Generated unrestricted PicoClaw config at {config_path} (live stream proxy -> {upstream_base})")
-    print(f"context_window={context_window} max_tokens={max_tokens} request_timeout={request_timeout}s")
+    print(f"context_window={context_window} max_tokens={max_tokens} request_timeout={request_timeout}s "
+          f"max_tool_iterations={cfg['agents']['defaults']['max_tool_iterations']}")
 
 
 if __name__ == "__main__":

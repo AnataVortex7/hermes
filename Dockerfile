@@ -41,6 +41,7 @@ WORKDIR /app
 COPY keep_alive.py /app/keep_alive.py
 COPY start.sh /app/start.sh
 COPY setup_picoclaw.py /app/setup_picoclaw.py
+COPY llm_proxy.py /app/llm_proxy.py
 COPY notify.py /app/notify.py
 RUN chmod +x /app/start.sh
 

@@ -15,6 +15,8 @@ Container runs `keep_alive.py` (health/dashboard on port 10000) and
 | `LLM_REQUEST_TIMEOUT` | no | seconds per LLM request; default and minimum `600` (10 min), can only be raised |
 | `LLM_CONTEXT_WINDOW` | no | model context size in tokens, default `250000` |
 | `LLM_MAX_TOKENS` | no | max output tokens per reply, default `32768` |
+| `LLM_MAX_TOOL_ITERATIONS` | no | max tool calls per turn, default `100` (was 50) |
+| `LLM_EXTRA_BODY` | no | JSON object merged into every request to your API, e.g. `{"reasoning_effort":"high"}` (only if your API supports it) |
 | `RCLONE_CONFIG_BASE64` | no | Google Drive backup of PicoClaw state |
 
 `~/.picoclaw/config.json` is rebuilt from these on every boot and is **not**
@@ -85,3 +87,42 @@ half-restored local files are wiped, a `🧹` message is sent, and Drive sync is
 the old backup on Drive is never overwritten. Restart once Drive works to get the old history back.
 Env vars: `NOTIFY_ENABLED=0` (all messages off), `NOTIFY_ON_BOOT=0` (skip the first one),
 `RESTORE_MAX_ATTEMPTS=0` or `ALLOW_START_WITHOUT_RESTORE=0` (never start without a restore: retry forever).
+
+## Agent quality guard (round-robin + lite models)
+Your custom API rotates several models and ends on `*-lite` ones; the model that answers can change
+**every turn**, and lite models are the ones that skip steps, send broken tool JSON or "announce" an
+action without doing it. Three layers handle that:
+
+1. **Operating protocol in `workspace/USER.md`** (rewritten on every boot, `setup_picoclaw.py`):
+   requirements checklist -> plan -> execute -> verify -> final report per requirement. The plan lives in
+   `workspace/tasks/current.md` (synced to Drive), so whichever model answers next can continue the same job.
+2. **`llm_proxy.py` (guard proxy on 127.0.0.1:18799)** - validates every agent reply before PicoClaw sees it:
+   retries 408/429/5xx; repairs or retries tool calls with invalid JSON / cut off by max_tokens; retries empty
+   replies and "Now I will run X:" replies that never call the tool (max 2 retries per request, stall retry max 1);
+   fixes Gemini-style parallel tool calls that all arrive with `index 0`; appends a short reminder to the *last*
+   message of each agent request (not saved in history), a stronger one when the previous answer came from a lite model.
+3. **Logs**: every call prints `[guard] model=<who answered> finish=... reason=ok|empty|stalled|bad_tool_json ... ms=<time> req_kb=<request size>`
+   in the Koyeb logs (also `/tmp/stream_proxy.log`), so you can see the round-robin, which model misbehaves, and whether 504s happen when `req_kb` (prompt size) is large.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `LLM_GUARD` | `1` | `0` = no validation/retry/reminder (proxy only folds SSE and retries HTTP errors) |
+| `LLM_REMINDER` | `1` | `0` = do not append the per-request reminder |
+| `LLM_GUARD_MAX_RETRIES` | `2` | retries of bad/empty/stalled replies. Each retry is one more call on your model quota - set `1` or `0` if quota is tight |
+| `LLM_HTTP_RETRIES` | `3` | retries on 408/429/5xx/connection errors (backoff `LLM_RETRY_BACKOFF`, default 2s, doubling) |
+| `LLM_FIRST_BYTE_TIMEOUT` | `90` | seconds without any response byte from your API before the call is treated as hung. Keep it BELOW Cloudflare's ~100 s silence limit, which is what produces `504 error code: 504` even when your API later logs `200 Success` |
+| `LLM_STREAM_IDLE_TIMEOUT` | `90` | seconds of silence in the middle of a streamed reply before it is treated as hung (keep-alive comments from the API reset it) |
+| `LLM_TIMEOUT_RETRIES` | `2` | retries after a hang / 504 / 524 / 408 (each retry is a fresh call, so your auto-router can pick another model) |
+| `LLM_LITE_PATTERN` | `lite` | regex on the model name returned by your API that switches to the stronger reminder |
+| `LLM_PROXY_ACCESS_LOG` | `0` | `1` = also log every HTTP request line |
+
+Tests (no network needed): `python3 -m unittest -v tests.test_llm_proxy`
+
+Note: `Setup Picoclaw.py` (with a space) is an old copy and is not used by the Dockerfile; `setup_picoclaw.py` is the live one.
+
+### 504 although the API logged "200 Success"
+`API request failed: Status: 504 Body: error code: 504` is an HTTP reply from the edge (Cloudflare/Koyeb) in front
+of your API, not a PicoClaw timer. If one call to a slow model (e.g. 184 s) sends no byte for ~100 s, the edge cuts
+the client with 504 while the backend keeps working and later logs 200. Real fix is in the API: open the SSE
+response immediately and send a comment line (`: keepalive` + blank line) every ~15 s until the model answers.
+The proxy ignores comment lines, so this is safe. Until then the proxy cuts silent calls at 90 s and retries.
