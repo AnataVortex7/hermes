@@ -72,3 +72,16 @@ Override with env `CRON_COMMAND_ALLOWED_REMOTES` (e.g. `telegram:123456789` or `
 On every boot a marked block is (re)written into `workspace/USER.md` telling the bot it has full
 permissions, so stale "cron is restricted" notes in its memory stop making it refuse.
 Python packages persist via `PYTHONUSERBASE=~/.picow_clow/pyuser` (synced to Drive).
+
+## Restart / restore notifications
+On every boot `start.sh` messages every numeric id in `TELEGRAM_ALLOW_FROM` (you must have pressed
+/start on the bot once):
+1. `🔄 Server restart ... restore सुरू` - right at boot (PicoClaw is NOT running yet).
+2. `✅ PicoClaw ready` - only after the Drive restore succeeded AND the gateway `/ready` returned 200
+   (with restore time, restored files, cron job count).
+PicoClaw is never started before the restore succeeds. A failed restore is retried (20s apart);
+after **2 failed attempts** (`RESTORE_MAX_ATTEMPTS`, default 2) it starts with a **clean history**:
+half-restored local files are wiped, a `🧹` message is sent, and Drive sync is disabled for that run so
+the old backup on Drive is never overwritten. Restart once Drive works to get the old history back.
+Env vars: `NOTIFY_ENABLED=0` (all messages off), `NOTIFY_ON_BOOT=0` (skip the first one),
+`RESTORE_MAX_ATTEMPTS=0` or `ALLOW_START_WITHOUT_RESTORE=0` (never start without a restore: retry forever).

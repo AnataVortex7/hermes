@@ -10,6 +10,13 @@ if [ -f /app/keep_alive.py ]; then
   python3 /app/keep_alive.py &
 fi
 
+BOOT_TS=$(date +%s)
+notify() { python3 /app/notify.py "$1" >/dev/null 2>&1 || true; }
+if [ "${NOTIFY_ON_BOOT:-1}" = "1" ]; then
+  notify "🔄 Server restart झाला. Google Drive वरून history restore सुरू आहे...
+PicoClaw अजून start केलेला नाही - restore पूर्ण झाल्यावर 'ready' message येईल, तोपर्यंत message पाठवू नका."
+fi
+
 # 1b. TAILSCALE (background, userspace mode: works on Koyeb without TUN/NET_ADMIN)
 # Needs TAILSCALE_AUTHKEY (use a Reusable + Ephemeral key). Services that listen
 # only on 127.0.0.1 are forwarded to your tailnet with `tailscale serve --tcp`.
@@ -91,19 +98,48 @@ picoclaw_sync() {
 # SYNC_SAFE=1 only if the restore finished OK. Otherwise the background sync
 # is disabled, so an empty local folder can never wipe the Drive backup.
 SYNC_SAFE=0
+RESTORE_OK=0
+RESTORE_SECS=0
+CLEAN_START=0
 if [ -f ~/.config/rclone/rclone.conf ]; then
-  echo ">> Ensuring remote backup directory exists..."
-  rclone mkdir "$REMOTE_BACKUP" 2>/dev/null || true
-  rclone mkdir "$PICOCLAW_REMOTE" 2>/dev/null || true
-
-  echo ">> Restoring PicoW Clow state from Google Drive ($REMOTE_BACKUP)..."
-  if rclone_sync sync "$REMOTE_BACKUP" ~/.picow_clow/ --drive-chunk-size 8M --exclude "picoclaw/**" \
-     && picoclaw_sync sync "$PICOCLAW_REMOTE" ~/.picoclaw/ --drive-chunk-size 8M; then
-    SYNC_SAFE=1
-    echo ">> Restore OK."
-  else
-    echo ">> Restore FAILED - background sync to Drive is DISABLED to protect the backup."
-  fi
+  # PicoClaw is NOT started until the restore has fully succeeded; a failed restore is retried
+  # (otherwise it would start with an empty history and the next sync would overwrite Drive).
+  #   After RESTORE_MAX_ATTEMPTS (default 2) failed attempts PicoClaw starts with a CLEAN history
+  #   (half-restored files are wiped first). Background sync to Drive stays DISABLED for that run
+  #   so the old backup on Drive is never overwritten. The next restart tries the restore again.
+  #   RESTORE_MAX_ATTEMPTS=0 or ALLOW_START_WITHOUT_RESTORE=0 -> never start without a restore (retry forever)
+  RESTORE_START=$(date +%s)
+  ATTEMPT=0
+  while true; do
+    ATTEMPT=$((ATTEMPT + 1))
+    echo ">> Restore attempt $ATTEMPT from Google Drive ($REMOTE_BACKUP)..."
+    rclone mkdir "$REMOTE_BACKUP" 2>/dev/null || true
+    rclone mkdir "$PICOCLAW_REMOTE" 2>/dev/null || true
+    if rclone_sync sync "$REMOTE_BACKUP" ~/.picow_clow/ --drive-chunk-size 8M --exclude "picoclaw/**" \
+       && picoclaw_sync sync "$PICOCLAW_REMOTE" ~/.picoclaw/ --drive-chunk-size 8M; then
+      SYNC_SAFE=1; RESTORE_OK=1
+      RESTORE_SECS=$(( $(date +%s) - RESTORE_START ))
+      echo ">> Restore OK (${RESTORE_SECS}s)."
+      break
+    fi
+    echo ">> Restore FAILED (attempt $ATTEMPT)."
+    if [ "${RESTORE_MAX_ATTEMPTS:-2}" -gt 0 ] && [ "$ATTEMPT" -ge "${RESTORE_MAX_ATTEMPTS:-2}" ] \
+       && [ "${ALLOW_START_WITHOUT_RESTORE:-1}" = "1" ]; then
+      echo ">> Restore failed $ATTEMPT times -> wiping partial local state and starting with a CLEAN history."
+      # Local-only wipe (container disk). Drive is untouched because SYNC_SAFE stays 0.
+      find ~/.picoclaw ~/.picow_clow -mindepth 1 -delete 2>/dev/null || true
+      mkdir -p ~/.picow_clow ~/.picoclaw
+      CLEAN_START=1
+      notify "🧹 Restore $ATTEMPT वेळा फेल झाला, म्हणून PicoClaw CLEAN history ने start होतोय (जुनी history या वेळी नाही).
+⚠️ Drive वरचा जुना backup सुरक्षित ठेवण्यासाठी या run चा Drive sync बंद आहे. Drive ठीक झाल्यावर Koyeb मध्ये redeploy/restart केला की जुनी history परत येईल."
+      break
+    fi
+    [ "$ATTEMPT" = "1" ] && notify "⚠️ Drive restore फेल झाला (attempt 1). PicoClaw अजून start केलेला नाही, परत प्रयत्न करतोय..."
+    sleep 20
+  done
+else
+  echo ">> No rclone config - nothing to restore (fresh state)."
+  notify "⚠️ rclone config नाही, म्हणून Drive restore झालं नाही (fresh state). RCLONE_CONFIG_BASE64 तपासा."
 fi
 
 mkdir -p "$PYTHONUSERBASE"
@@ -158,6 +194,46 @@ if command -v picoclaw >/dev/null 2>&1 && python3 /app/setup_picoclaw.py; then
   echo ">> Starting PicoClaw gateway (Telegram)..."
   picoclaw gateway &
   APP_PID=$!
+
+  # Tell the owner on Telegram when PicoClaw is really up (gateway /ready == 200).
+  (
+    HP="${PICOCLAW_HEALTH_PORT:-18790}"
+    READY=0
+    for _ in $(seq 1 120); do
+      kill -0 "$APP_PID" 2>/dev/null || break
+      if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HP/ready" 2>/dev/null)" = "200" ]; then
+        READY=1; break
+      fi
+      sleep 1
+    done
+    TOTAL=$(( $(date +%s) - BOOT_TS ))
+    JOBS=$(python3 - <<'PY' 2>/dev/null
+import json, os
+try:
+    p = os.path.expanduser("~/.picoclaw/workspace/cron/jobs.json")
+    print(len(json.load(open(p)).get("jobs", [])))
+except Exception:
+    print(0)
+PY
+)
+    PKGS=$(cat "$INST/pip.list" 2>/dev/null | wc -l)
+    FILES=$(find ~/.picoclaw ~/.picow_clow -type f 2>/dev/null | wc -l)
+    if [ "$READY" = "1" ] && [ "$RESTORE_OK" = "1" ]; then
+      notify "✅ PicoClaw ready! Restore पूर्ण, history आणि सगळं परत आलंय. आता message पाठवू शकता.
+⏱ Restore: ${RESTORE_SECS}s | एकूण boot: ${TOTAL}s
+📁 Restored files: ${FILES} | ⏰ Cron jobs: ${JOBS} | 📦 Persisted pip pkgs: ${PKGS}"
+    elif [ "$READY" = "1" ] && [ "$CLEAN_START" = "1" ]; then
+      notify "✅ PicoClaw ready - पण CLEAN history ने (Drive restore फेल झाला). Boot: ${TOTAL}s
+ℹ️ या run ची history Drive ला save होणार नाही. Drive ठीक झाल्यावर restart करा."
+    elif [ "$READY" = "1" ]; then
+      notify "⚠️ PicoClaw चालू आहे, पण Drive restore पूर्ण नाही झाला. (${TOTAL}s)"
+    elif kill -0 "$APP_PID" 2>/dev/null; then
+      notify "⚠️ PicoClaw process चालू आहे पण /ready check 120s मध्ये आला नाही. Koyeb logs बघा. (Restore: $([ "$RESTORE_OK" = "1" ] && echo OK || echo NOT-OK))"
+    else
+      notify "❌ PicoClaw start होताच बंद पडला. Koyeb logs तपासा."
+    fi
+  ) &
+
   wait "$APP_PID"
 elif [ -f /app/main.py ]; then
   echo ">> Starting main.py..."
@@ -167,5 +243,6 @@ elif [ -f /app/app.py ]; then
   python3 /app/app.py
 else
   echo ">> PicoClaw not started (check TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOW_FROM / LLM_API_KEY). Keeping container alive..."
+  notify "❌ PicoClaw start झाला नाही (setup फेल). TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOW_FROM / LLM_API_KEY तपासा. Restore: $([ "$RESTORE_OK" = "1" ] && echo OK || echo NOT-OK)"
   sleep infinity
 fi
