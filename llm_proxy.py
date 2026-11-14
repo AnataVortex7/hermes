@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -541,6 +542,101 @@ def read_completion(resp, hard_deadline=None):
     return None, raw
 
 
+# --------------------------------------------------------------------------- typing keeper
+class TypingKeeper:
+    """Keeps Telegram's "typing..." indicator alive for the whole time the agent is working.
+
+    Telegram hides the indicator ~5 s after the last sendChatAction, so during a long LLM call or a long
+    `exec` it disappears and the chat looks dead. This proxy sees every agent request, so it knows when a turn
+    starts (user/tool message arrives), keeps going while the model asks for tools (tools run between LLM calls),
+    and stops when the model gives a final answer (reply without tool calls) or after MAX_IDLE of silence.
+    """
+
+    def __init__(self, send, interval=4.0, max_idle=720.0, linger=1.5):
+        self.send = send
+        self.interval = interval
+        self.max_idle = max_idle          # > LLM timeout (600s) + some tool time; any proxy activity resets it
+        self.linger = linger
+        self._lock = threading.Lock()
+        self._active = False
+        self._last = 0.0
+        self._off_at = 0.0
+        self._thread = None
+
+    def touch(self):
+        """Agent is working (LLM request started/finished with tool calls)."""
+        with self._lock:
+            self._active = True
+            self._last = time.time()
+            self._off_at = 0.0
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._loop, daemon=True)
+                self._thread.start()
+
+    def finish(self):
+        """Final answer delivered: stop shortly after (lets the message land first)."""
+        with self._lock:
+            self._off_at = time.time() + self.linger
+
+    def is_on(self):
+        with self._lock:
+            now = time.time()
+            if not self._active:
+                return False
+            if self._off_at and now >= self._off_at:
+                self._active = False
+                return False
+            if now - self._last > self.max_idle:
+                self._active = False
+                return False
+            return True
+
+    def _loop(self):
+        while True:
+            if not self.is_on():
+                threading.Event().wait(0.2)
+                with self._lock:
+                    if not self._active:
+                        self._thread = None
+                        return
+                continue
+            try:
+                self.send()
+            except Exception as exc:  # noqa: BLE001
+                log(f"typing send failed: {exc!r}")
+            threading.Event().wait(self.interval)
+
+
+def _telegram_typing_sender():
+    token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    ids = [x.strip() for x in (os.environ.get("TELEGRAM_ALLOW_FROM") or "").split(",") if x.strip().lstrip("-").isdigit()]
+    if not token or not ids:
+        return None
+    failed = {"n": 0}
+
+    def send():
+        for cid in ids:
+            data = urllib.parse.urlencode({"chat_id": cid, "action": "typing"}).encode()
+            req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendChatAction", data=data)
+            try:
+                urllib.request.urlopen(req, timeout=5).read()
+                failed["n"] = 0
+            except Exception as exc:  # noqa: BLE001
+                failed["n"] += 1
+                if failed["n"] in (1, 20):
+                    log(f"typing: sendChatAction failed for {cid}: {type(exc).__name__}")
+    return send
+
+
+TYPING_ENABLED = (os.environ.get("TYPING_KEEPALIVE", "1").strip() != "0")
+TYPING = None
+if TYPING_ENABLED:
+    _sender = _telegram_typing_sender()
+    if _sender:
+        TYPING = TypingKeeper(_sender, interval=_env_float("TYPING_INTERVAL", 4.0),
+                              max_idle=_env_float("TYPING_MAX_IDLE", 720.0))
+
+
 # --------------------------------------------------------------------------- handler
 class GuardProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -606,6 +702,8 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
                 body = json.dumps(payload).encode("utf-8")
             self._passthrough(target_url, body, client_wants_stream)
         except Exception as exc:  # noqa: BLE001
+            if TYPING is not None:
+                TYPING.finish()               # request failed: do not leave "typing..." on
             try:
                 self._send_json(502, {"error": {"message": f"stream_proxy error: {exc}"}})
             except Exception:  # noqa: BLE001
@@ -680,6 +778,8 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
         if guard_on and REMINDER:
             inject_reminder(payload, strong=prev_lite or prev_bad)
 
+        if agent_turn and TYPING is not None:
+            TYPING.touch()                  # turn started / continues after a tool: keep "typing..." on
         semantic_retries = 0
         stall_retried = False
         read_failures = 0
@@ -688,6 +788,8 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
         hard_deadline = call_started + TIMEOUT
         while True:
             started = time.time()
+            if agent_turn and TYPING is not None:
+                TYPING.touch()
             body = json.dumps(payload).encode("utf-8")
             conn, resp = open_upstream("POST", target_url, self._forward_headers(body), body, retry_deadline)
             try:
@@ -703,10 +805,17 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
             finally:
                 conn.close()
             if comp is None:                      # upstream error / non-completion: pass it on
+                if agent_turn and TYPING is not None:
+                    TYPING.finish()
                 self._send_raw(resp, raw)
                 return
             def _deliver(c):
                 ch0 = (c.get("choices") or [{}])[0]
+                if agent_turn and TYPING is not None:
+                    if (ch0.get("message") or {}).get("tool_calls"):
+                        TYPING.touch()      # tools will run now, next LLM call follows: stay "typing"
+                    else:
+                        TYPING.finish()     # final answer
                 if ch0.get("finish_reason") == "incomplete_stream":
                     ch0["finish_reason"] = "length"       # retries used up: tell PicoClaw it is cut, not finished
                 if as_stream:

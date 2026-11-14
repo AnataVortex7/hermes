@@ -133,3 +133,10 @@ The proxy ignores comment lines, so this is safe. By default the proxy waits the
 - **Streaming bypass**: agent requests (with `tools`) are validated even when PicoClaw asks for `stream=true` (Telegram streaming); the validated reply is re-emitted as SSE. `LLM_GUARD_STREAM=0` turns this off.
 - **Temperature**: agent turns use `LLM_AGENT_TEMPERATURE` (default `0.3`; empty = leave PicoClaw's value) for more reliable tool JSON.
 - Check in Koyeb logs: agent turns must print `[guard] model=... reason=ok`. If they do not, the guard was being bypassed.
+
+## Typing indicator stays on while working
+Telegram hides "typing..." ~5 s after the last `sendChatAction`, so during long LLM calls or long `exec` runs the chat looked dead.
+`llm_proxy.py` now re-sends `typing` every 4 s from the moment an agent turn starts, keeps it on while the model asks for tools
+(tools run between LLM calls), and stops right after the final answer (or after `TYPING_MAX_IDLE`=720 s of no proxy activity, or on an error).
+Uses `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ALLOW_FROM` (private chats). Env: `TYPING_KEEPALIVE=0` off, `TYPING_INTERVAL` (default 4), `TYPING_MAX_IDLE` (default 720).
+Limit: it only knows about work that goes through the LLM proxy; background `spawn` sub-agents while the main agent waits without calling the model are not covered.

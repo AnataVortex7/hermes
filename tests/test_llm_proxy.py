@@ -107,6 +107,10 @@ class Upstream(BaseHTTPRequestHandler):
                 self.wfile.write(b"data: [DONE]\n\n")
 
 
+def wait(sec):
+    threading.Event().wait(sec)      # real wait (setUp stubs time.sleep)
+
+
 def free_port():
     import socket
     s = socket.socket()
@@ -347,6 +351,45 @@ class ProxyTests(unittest.TestCase):
         req = urllib.request.Request(self.url, json.dumps(body).encode(), {"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=20).read()
         self.assertEqual(SEEN[0]["temperature"], 0.3)
+
+    # ---- typing keeper
+    def _fresh_keeper(self):
+        import time as _t
+        sent = []
+        k = self.mod.TypingKeeper(lambda: sent.append(1), interval=0.05, max_idle=5, linger=0.05)
+        self.mod.TYPING = k
+        self.addCleanup(setattr, self.mod, "TYPING", None)
+        return k, sent, _t
+
+    def test_typing_stays_on_across_tool_calls_and_stops_after_final_answer(self):
+        k, sent, t = self._fresh_keeper()
+        SCRIPT.append(sse(*tool_chunks([(0, "c1", "exec", '{"cmd":"sleep 600"}')])))
+        self.call(self.msg())                      # model asks for a tool -> tool runs -> typing must stay on
+        wait(0.4)
+        self.assertTrue(k.is_on())
+        self.assertGreaterEqual(len(sent), 3)
+        SCRIPT.append(sse(*text_chunks("Final answer. " + "x" * 50)))
+        self.call([{"role": "tool", "content": "ok", "tool_call_id": "c1"}])
+        wait(0.5)
+        self.assertFalse(k.is_on())
+        n = len(sent)
+        wait(0.3)
+        self.assertEqual(len(sent), n)             # really stopped
+
+    def test_typing_stops_after_max_idle(self):
+        k = self.mod.TypingKeeper(lambda: None, interval=0.05, max_idle=0.2, linger=0.05)
+        k.touch()
+        self.assertTrue(k.is_on())
+        wait(0.4)
+        self.assertFalse(k.is_on())
+
+    def test_typing_not_started_for_plain_non_agent_calls(self):
+        k, sent, t = self._fresh_keeper()
+        SCRIPT.append(sse(*text_chunks("summary")))
+        self.call(self.msg("summarize"), tools=False)
+        self.assertFalse(k.is_on())
+        self.assertEqual(sent, [])
+
 
     def test_upstream_error_is_passed_through_after_retries(self):
         SCRIPT.extend([("status", 500)] * 4)
