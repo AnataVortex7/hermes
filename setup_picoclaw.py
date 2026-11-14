@@ -2,21 +2,27 @@
 """Generate ~/.picoclaw/config.json from environment variables AND ensure:
 1. Full unrestricted command/script/cron execution permissions for Telegram ID 1193564058
 2. 100% persistent Python/pip, npm, and apt packages across restarts (saved directly inside
-   ~/.picoclaw/workspace/.installed/ which is synced to Google Drive, PLUS a persistent
-   PYTHONUSERBASE inside ~/.picoclaw/workspace/.local so pip packages survive without even
-   needing re-download!)
+   ~/.picoclaw/workspace/.installed/ which is synced to Google Drive)
 3. 360-second (6-minute) request timeout + local Stream-to-JSON bridge on 127.0.0.1:18799
+4. Instant Telegram Startup Notification to 1193564058 reporting:
+   - Service Restart Timestamp (IST)
+   - Google Drive (rclone) Backup Restore Status + file/cron counts
+   - Restored Python/apt/npm packages
 """
+import datetime
 import json
 import os
 import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
 DEFAULT_TELEGRAM_ID = "1193564058"
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 home = Path(os.environ.get("PICOCLAW_HOME", Path.home() / ".picoclaw"))
 home.mkdir(parents=True, exist_ok=True)
@@ -25,20 +31,67 @@ ws_dir = home / "workspace"
 cfg_path = home / "config.json"
 
 # ---------------------------------------------------------------------------
+# 0. CHECK GOOGLE DRIVE (RCLONE) RESTORE STATUS BEFORE MODIFYING WORKSPACE
+# ---------------------------------------------------------------------------
+rclone_conf_b64 = os.environ.get("RCLONE_CONFIG_BASE64", "").strip()
+rclone_conf_file = Path.home() / ".config" / "rclone" / "rclone.conf"
+has_rclone_cfg = bool(rclone_conf_b64) or (rclone_conf_file.exists() and rclone_conf_file.stat().st_size > 0)
+
+# Count files already restored into ~/.picoclaw/workspace by start.sh (excluding our internal folders)
+existing_ws_files = []
+if ws_dir.exists():
+    for p in ws_dir.rglob("*"):
+        if p.is_file() and ".installed" not in p.parts:
+            existing_ws_files.append(p)
+
+# If rclone is configured but start.sh didn't restore any files yet, run a safety restore pass
+rclone_pulled_now = False
+rclone_err_msg = ""
+if has_rclone_cfg and len(existing_ws_files) == 0 and shutil.which("rclone"):
+    try:
+        res = subprocess.run(
+            ["rclone", "copy", "drive:picow_clow_backup/picoclaw", str(home), "--exclude", "config.json"],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+        if res.returncode == 0:
+            rclone_pulled_now = True
+            existing_ws_files = [
+                p for p in ws_dir.rglob("*") if p.is_file() and ".installed" not in p.parts
+            ]
+        else:
+            rclone_err_msg = (res.stderr or res.stdout or "").strip()[:180]
+    except Exception as e:
+        rclone_err_msg = str(e)[:180]
+
+# Count restored cron jobs if jobs.json exists
+cron_jobs_count = 0
+cron_jobs_file = ws_dir / "cron" / "jobs.json"
+if cron_jobs_file.exists():
+    try:
+        cdata = json.loads(cron_jobs_file.read_text(encoding="utf-8"))
+        if isinstance(cdata, list):
+            cron_jobs_count = len(cdata)
+        elif isinstance(cdata, dict):
+            cron_jobs_count = len(cdata.get("jobs") or cdata)
+    except Exception:
+        pass
+
+if not has_rclone_cfg:
+    rclone_status_line = "⚠️ Not Configured (RCLONE_CONFIG_BASE64 नाही)"
+elif rclone_err_msg:
+    rclone_status_line = f"❌ Error ({rclone_err_msg})"
+elif len(existing_ws_files) > 0:
+    rclone_status_line = f"✅ Restored ({len(existing_ws_files)} workspace files, {cron_jobs_count} cron jobs)"
+else:
+    rclone_status_line = "✅ Connected (Fresh workspace / 0 prior files)"
+
+
+# ---------------------------------------------------------------------------
 # 1. PERSISTENT PACKAGE STORAGE & AUTO-RESTORE (Survives every server restart!)
 # ---------------------------------------------------------------------------
-# Why packages were disappearing before:
-# - `start.sh` only backed up `~/.picoclaw` to `drive:picow_clow_backup/picoclaw`,
-#   or when the bot ran `python3 -m pip install ...` or `/usr/bin/pip install ...`,
-#   it bypassed `/app/bin/pip` and didn't record packages into `~/.picoclaw`.
-#
-# Double-layer fix implemented here:
-# Layer A: Store package lists in `~/.picoclaw/workspace/.installed/` (which is ALWAYS
-#          backed up to Google Drive with `~/.picoclaw`) AND symlink `/root/.picow_clow/installed`
-#          to it so old and new scripts share the exact same Drive-backed directory.
-# Layer B: Hook Python's global `sitecustomize.py` so even `python3 -m pip install <pkg>`
-#          automatically records the installed package into `pip.list` AND triggers
-#          auto-restore on startup!
 pkg_dir = ws_dir / ".installed"
 pkg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -61,7 +114,6 @@ pip_list_file = pkg_dir / "pip.list"
 apt_list_file = pkg_dir / "apt.list"
 npm_list_file = pkg_dir / "npm.list"
 
-# Pre-seed essential Python packages (requests, beautifulsoup4, lxml) so they are always present
 default_pip_pkgs = {"requests", "beautifulsoup4", "lxml"}
 existing_pip = set()
 if pip_list_file.exists():
@@ -69,7 +121,6 @@ if pip_list_file.exists():
 all_pip_pkgs = sorted(existing_pip | default_pip_pkgs)
 pip_list_file.write_text("\n".join(all_pip_pkgs) + "\n", encoding="utf-8")
 
-# Restore any missing apt packages from Drive-backed apt.list
 if apt_list_file.exists():
     apt_pkgs = [x.strip() for x in apt_list_file.read_text().splitlines() if x.strip() and not x.startswith("#")]
     if apt_pkgs:
@@ -77,23 +128,21 @@ if apt_list_file.exists():
         subprocess.run(["/usr/bin/apt-get", "update", "-qq"], check=False)
         subprocess.run(["/usr/bin/apt-get", "install", "-y", "--no-install-recommends"] + apt_pkgs, check=False)
 
-# Restore all pip packages from Drive-backed pip.list
+pip_restored_ok = False
 if all_pip_pkgs:
     print(f">> [picoclaw] Restoring pip packages: {' '.join(all_pip_pkgs)}")
-    subprocess.run(
+    pip_res = subprocess.run(
         [sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", "--no-cache-dir"] + all_pip_pkgs,
         check=False,
     )
+    pip_restored_ok = (pip_res.returncode == 0)
 
-# Restore any npm global packages from Drive-backed npm.list
 if npm_list_file.exists():
     npm_pkgs = [x.strip() for x in npm_list_file.read_text().splitlines() if x.strip() and not x.startswith("#")]
     if npm_pkgs and shutil.which("npm"):
         print(f">> [picoclaw] Restoring npm packages: {' '.join(npm_pkgs)}")
         subprocess.run(["/usr/bin/npm", "install", "-g"] + npm_pkgs, check=False)
 
-# Install a wrapper for pip/pip3 AND a Python sitecustomize hook so even `python3 -m pip install ...`
-# is automatically captured into `~/.picoclaw/workspace/.installed/pip.list`!
 pip_recorder_code = f'''#!/usr/bin/env python3
 import sys, os
 from pathlib import Path
@@ -155,7 +204,6 @@ if missing:
     print(f">> [picoclaw] missing env: {', '.join(missing)}", file=sys.stderr)
     sys.exit(1)
 
-# Try upgrading picoclaw binary to the latest release so `command_allowed_remotes` is supported
 try:
     subprocess.run(["picoclaw", "update"], timeout=45, check=False)
 except Exception:
@@ -448,5 +496,40 @@ sec_content = (
 sec_path.write_text(sec_content, encoding="utf-8")
 sec_path.chmod(0o600)
 
-print(f">> [picoclaw] wrote {cfg_path} & {sec_path} (Telegram ID {DEFAULT_TELEGRAM_ID} + persistent pip/apt/npm packages enabled)")
+
+# ---------------------------------------------------------------------------
+# 3. SEND STARTUP / RESTART NOTIFICATION TO TELEGRAM BOT
+# ---------------------------------------------------------------------------
+def _send_startup_telegram_alert():
+    now_ist = datetime.datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p IST")
+    pip_summary = ", ".join(all_pip_pkgs[:8]) + (f" (+{len(all_pip_pkgs)-8} more)" if len(all_pip_pkgs) > 8 else "")
+    pkg_status = f"✅ Restored ({pip_summary})" if pip_restored_ok else f"⚠️ Check logs ({pip_summary})"
+
+    msg_text = (
+        f"🔄 *PicoClaw / Hermes Service Restarted!*\n\n"
+        f"🕒 *वेळ:* `{now_ist}`\n"
+        f"☁️ *Google Drive (rclone):* {rclone_status_line}\n"
+        f"📦 *Python Packages:* {pkg_status}\n"
+        f"⏱️ *LLM Timeout:* `{req_timeout}s` (Stream Bridge: `ON`)\n"
+        f"🔓 *Cron & Shell Exec:* `Full Access Enabled`"
+    )
+
+    for chat_id in allow:
+        try:
+            api_url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = urllib.parse.urlencode({
+                "chat_id": chat_id,
+                "text": msg_text,
+                "parse_mode": "Markdown",
+            }).encode("utf-8")
+            req = urllib.request.Request(api_url, data=payload, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+            print(f">> [picoclaw] sent restart notification to Telegram ID {chat_id}")
+        except Exception as e:
+            print(f">> [picoclaw] failed to send Telegram startup alert to {chat_id}: {e}", file=sys.stderr)
+
+_send_startup_telegram_alert()
+
+print(f">> [picoclaw] wrote {cfg_path} & {sec_path} (Telegram ID {DEFAULT_TELEGRAM_ID} + startup alert sent)")
 print(f">> [picoclaw] model={model['model']} alias={model_name} upstream_host={urlparse(upstream_base).netloc or '(none)'}")
