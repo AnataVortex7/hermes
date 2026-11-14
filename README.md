@@ -140,3 +140,30 @@ Telegram hides "typing..." ~5 s after the last `sendChatAction`, so during long 
 (tools run between LLM calls), and stops right after the final answer (or after `TYPING_MAX_IDLE`=720 s of no proxy activity, or on an error).
 Uses `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ALLOW_FROM` (private chats). Env: `TYPING_KEEPALIVE=0` off, `TYPING_INTERVAL` (default 4), `TYPING_MAX_IDLE` (default 720).
 Limit: it only knows about work that goes through the LLM proxy; background `spawn` sub-agents while the main agent waits without calling the model are not covered.
+
+## Dashboards from Telegram + protected server
+**Make a dashboard live (any topic):** tell the AI "dashboard live kar". It builds the page in `workspace/dashboards/<name>/`,
+runs `dash start <name> <folder>` and sends you the URL (`http://hermes:81xx/` or `http://100.x.y.z:81xx/`). Open it on any device
+that is logged in to your Tailscale - no extra setup. `bin/dash` only ever publishes ports 8100-8199 (own server: `dash start n --cmd "python3 app.py --port {port}" --dir folder`).
+`dash list|url|stop|restart`. After a server restart `start.sh` runs `dash restore`, so dashboards come back with the same URLs (registry is in the workspace, synced to Drive).
+Needs the existing `TAILSCALE_AUTHKEY`; no new env var.
+
+**Protected server:** the proxy checks every tool call the model emits and blocks changes to `/app`, `/usr`, `/etc`, Tailscale
+(`up/down/serve/set`, `tailscaled`), `~/.picoclaw/config.json`, `.security.yml`, rclone config, killing proxy/gateway, and `rm` of top-level dirs.
+The model gets a `BLOCKED` message and is told to use `dash` or to ask you; if it keeps trying, the call is replaced by a refusal and never reaches PicoClaw.
+Reading is allowed. Disable with `PROTECT_SYSTEM=0`. This is a guardrail on what the model asks for (string checks), not an OS sandbox:
+a determined obfuscated command could slip through. Real isolation = run the gateway as a non-root user with `/app` read-only (not done here).
+
+## All ports on Tailscale (`tsports`)
+Koyeb exposes only one public port (10000). `bin/tsports watch` (started by `start.sh` right after Tailscale connects) scans every 5 s for
+TCP ports the server listens on (PicoClaw gateway 18790, web UI 18800, Hermes dashboard 9119, `dash` dashboards 81xx, anything new) and publishes
+each with `tailscale serve --tcp=<port>`; ports that stop listening are removed after ~15 s. An index page with clickable links is on
+`http://hermes:8099/`; `tsports list` prints the same in the shell. Excluded by default: 1055 (Tailscale SOCKS), 18799 (LLM proxy, holds the API key), 22, 53 and ports above 32767 (ephemeral).
+Env: `TS_EXCLUDE_PORTS`, `TS_MAX_PORT`, `TS_INTERVAL`, `TS_INDEX_PORT` (0 = off). Non-HTTP ports are forwarded too but only open in a browser if they speak HTTP.
+Only devices logged in to YOUR tailnet can reach them (nothing is public). Note: a service that listens only on a non-loopback container IP is forwarded to that IP.
+
+## Reliability fixes (typing / missing replies)
+- Typing indicator stops as soon as the turn ends with `send_file` (before: it kept typing up to 12 min). After quick tools (read/write file ...) it waits max `TYPING_QUICK_TOOL_IDLE`=150 s for the next request; after `exec`/web/spawn up to `TYPING_MAX_IDLE`=720 s.
+- Semantic retries (bad/empty/blocked replies) no longer run past PicoClaw's own request timeout - a late answer after PicoClaw gave up was simply lost.
+- Streaming clients (`stream=true`, Telegram streaming) get `: keep-alive` SSE comments every `LLM_SSE_KEEPALIVE`=8 s while the reply is validated, so PicoClaw does not time out on a silent socket. Errors after the first ping are reported in-band.
+- The log now says `typing keeper OFF: ...` at start if `TELEGRAM_BOT_TOKEN` / numeric `TELEGRAM_ALLOW_FROM` are missing.

@@ -73,6 +73,9 @@ if [ -n "$TAILSCALE_AUTHKEY" ] && command -v tailscaled >/dev/null 2>&1; then
           echo ">> [tailscale] could not forward port $p"
         fi
       done
+      # publish EVERY listening port (PicoClaw gateway/UI, dashboards, ...) automatically + index page on :8099
+      echo ">> [tailscale] starting port watcher (all listening ports -> tailnet)"
+      tsports watch >> /tmp/tsports.log 2>&1 &
     else
       echo ">> [tailscale] 'tailscale up' failed - last log lines:"
       tail -n 15 /tmp/tailscale/tailscaled.log 2>/dev/null
@@ -247,6 +250,8 @@ if command -v picoclaw >/dev/null 2>&1 && run_logged /tmp/setup_picoclaw.log pyt
   TAIL_PID=$!
   picoclaw gateway >> /tmp/picoclaw.log 2>&1 &
   APP_PID=$!
+  # bring back dashboards published earlier with `dash start` (waits for Tailscale itself)
+  ( dash restore >> /tmp/dash.log 2>&1 & ) 2>/dev/null
 
   # Wait up to 120s in the main shell to verify PicoClaw is up (gateway /ready == 200) or detect early crash.
   HP="${PICOCLAW_HEALTH_PORT:-18790}"

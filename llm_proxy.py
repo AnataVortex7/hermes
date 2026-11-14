@@ -30,6 +30,7 @@ import json
 import os
 import random
 import re
+import shlex
 import socket
 import sys
 import threading
@@ -69,6 +70,7 @@ TIMEOUT_RETRIES = _env_int("LLM_TIMEOUT_RETRIES", 0)    # default 0: do not send
 BAD_REPLY_RETRIES = _env_int("LLM_GUARD_MAX_RETRIES", 2)  # bad/empty/stalled replies
 BACKOFF = _env_float("LLM_RETRY_BACKOFF", 2.0)
 LITE_RE = re.compile(os.environ.get("LLM_LITE_PATTERN", "lite") or "lite", re.I)
+KEEPALIVE_SECS = float(os.environ.get("LLM_SSE_KEEPALIVE", "8"))   # comment pings while a streamed reply is validated
 GUARD_STREAM = (os.environ.get("LLM_GUARD_STREAM", "1").strip() != "0")   # validate agent turns even if PicoClaw asked for SSE
 try:
     AGENT_TEMPERATURE = float((os.environ.get("LLM_AGENT_TEMPERATURE", "0.3") or "").strip())  # "" = leave as is
@@ -330,6 +332,58 @@ def rewrite_send_file_result(payload):
     return False
 
 
+# PicoClaw ends the turn right after `send_file` (no further LLM call; it stores a canned "delivered" reply),
+# so the model's final text is never produced or shown. The explanation must therefore be sent with the
+# `message` tool in the SAME response, before `send_file`.
+_TURN_ENDING_TOOLS = {"send_file"}
+_SLOW_TOOLS = {"exec", "spawn", "subagent", "web_fetch", "web_search", "cron", "install_skill", "find_skills"}
+QUICK_TOOL_IDLE = float(os.environ.get("TYPING_QUICK_TOOL_IDLE", "150"))
+_MIN_EXPLANATION_CHARS = int(os.environ.get("MIN_EXPLANATION_CHARS", "120"))
+
+
+def _longest_text(args):
+    best = 0
+    if isinstance(args, dict):
+        for v in args.values():
+            if isinstance(v, str):
+                best = max(best, len(v.strip()))
+    return best
+
+
+def _tool_args(tc):
+    try:
+        a = json.loads((tc.get("function") or {}).get("arguments") or "{}")
+        return a if isinstance(a, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def send_file_unexplained(payload, tool_calls):
+    """True if this response sends a file but no explanatory `message` was sent first (this response or earlier this turn)."""
+    names = {((t.get("function") or {}).get("name") or "") for t in (payload.get("tools") or []) if isinstance(t, dict)}
+    if "message" not in names:
+        return False
+    calls = tool_calls or []
+    if not any(((c.get("function") or {}).get("name") in _TURN_ENDING_TOOLS) for c in calls):
+        return False
+    explained = False
+    for m in reversed(payload.get("messages") or []):          # earlier in this same turn
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "user" and not str(m.get("content") or "").lstrip().startswith("[hermes-guard]"):
+            break
+        for c in m.get("tool_calls") or []:
+            if (c.get("function") or {}).get("name") == "message" and _longest_text(_tool_args(c)) >= _MIN_EXPLANATION_CHARS:
+                explained = True
+    for c in calls:                                              # earlier in this response
+        name = (c.get("function") or {}).get("name")
+        if name == "message" and _longest_text(_tool_args(c)) >= _MIN_EXPLANATION_CHARS:
+            explained = True
+        elif name in _TURN_ENDING_TOOLS and not explained:
+            return True
+    return False
+
+
 def classify(comp, payload):
     """Return a reason string if the reply is bad, else None."""
     try:
@@ -345,6 +399,12 @@ def classify(comp, payload):
             return reason
         if choice.get("finish_reason") == "length":
             return "truncated_tool_call"
+        why = find_violation(msg.get("tool_calls"))
+        if why:
+            comp["_violation"] = why
+            return "protected"
+        if send_file_unexplained(payload, msg.get("tool_calls")):
+            return "send_file_unexplained"
         return None
     content = msg.get("content") or ""
     if not content.strip():
@@ -357,6 +417,114 @@ def classify(comp, payload):
         return "no_explanation"
     if payload.get("tools") and looks_stalled(content, last_role):
         return "stalled"
+    return None
+
+
+# --------------------------------------------------------------------------- system protection
+# The agent runs as root and has "full permissions", but it must not change the server itself: the app code,
+# Tailscale, bot/API config. Every tool call the model emits is checked here BEFORE PicoClaw executes it;
+# a blocked call is bounced back to the model with an explanation. (A guardrail on what the model asks for,
+# not an OS sandbox - see README for hardening.)
+PROTECT = (os.environ.get("PROTECT_SYSTEM", "1").strip() != "0")
+
+_PROT_PATH_RE = re.compile(
+    r"(?<![\w.\-])(?:/app|/usr|/etc|/bin|/sbin|/lib|/lib64|/opt/pw)(?=/|\s|$|[\"'`;|&)])"
+    r"|\.picoclaw/(?:config\.json|\.security\.yml)\b|rclone\.conf\b"
+)
+_READ_CMDS = {"cat", "ls", "head", "tail", "grep", "egrep", "wc", "diff", "stat", "file", "less", "more",
+              "cd", "echo", "pwd", "du", "tree", "sha256sum", "md5sum", "which", "type", "test", "["}
+_TS_READ_SUBS = {"status", "ip", "ping", "whois", "netcheck", "version", "metrics", "dns", "id", "licenses", "bugreport"}
+_SPLIT_RE = re.compile(r"&&|\|\||[;|\n]")
+_KILL_RE = re.compile(r"\b(?:pkill|killall|kill)\b.*(?:tailscaled|llm_proxy|keep_alive|start\.sh|picoclaw)", re.I)
+_RMROOT_RE = re.compile(r"\brm\b[^;|&\n]*\s(?:/|~|\$HOME|/root|/root/\.picoclaw|/root/\.picow_clow)/?(?=\s|$)")
+_WRITE_TOOLS = {"write_file", "edit_file", "append_file"}
+_DASH_HINT = ("To publish a dashboard use `dash start <name> <folder>` (it prints the Tailscale URL). "
+              "Do not change system files, Tailscale or config yourself; if a change is really needed, "
+              "tell the user exactly what to change and why, and stop.")
+
+
+def _norm(text):
+    return (text or "").replace("~/", "/root/").replace("$HOME", "/root").replace("${HOME}", "/root")
+
+
+def _segment_violation(seg):
+    seg = seg.strip()
+    if not seg:
+        return None
+    toks = shlex.split(seg, posix=True) if _safe_split(seg) else seg.split()
+    while toks and (toks[0] in ("sudo", "nohup", "time", "env") or "=" in toks[0].split("/")[0]):
+        toks = toks[1:]
+    if not toks:
+        return None
+    head = os.path.basename(toks[0])
+    if head in ("tailscaled",):
+        return "starting/stopping tailscaled"
+    if head == "tailscale":
+        sub = ""
+        skip = False
+        for t in toks[1:]:
+            if skip:
+                skip = False
+                continue
+            if t == "--socket":
+                skip = True
+                continue
+            if t.startswith("-"):
+                continue
+            sub = t
+            break
+        if sub and sub not in _TS_READ_SUBS:
+            return f"`tailscale {sub}` (changes Tailscale)"
+        return None
+    if _PROT_PATH_RE.search(_norm(seg)):
+        if head in ("python", "python3") and re.search(r"/app/notify\.py\b", seg):
+            return None
+        write_marks = (">" in seg) or re.search(r"\s-i\b|--in-place|\btee\b|-delete\b|-exec\b|\bchmod\b|\bchown\b", seg)
+        if head in _READ_CMDS and not write_marks:
+            return None
+        if head == "sed" and re.search(r"\s-n\b", seg) and not write_marks:
+            return None
+        if head == "find" and not write_marks:
+            return None
+        return "writing to a protected system path"
+    return None
+
+
+def _safe_split(seg):
+    try:
+        shlex.split(seg, posix=True)
+        return True
+    except ValueError:
+        return False
+
+
+def find_violation(tool_calls):
+    """Return a human-readable reason if any tool call would change the protected system, else None."""
+    if not PROTECT:
+        return None
+    for tc in tool_calls or []:
+        fn = tc.get("function") or {}
+        name = fn.get("name") or ""
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(args, dict):
+            continue
+        if name in _WRITE_TOOLS:
+            path = _norm(str(args.get("path") or ""))
+            if _PROT_PATH_RE.search(path):
+                return f"{name} on protected path {args.get('path')}"
+        elif name == "exec":
+            cmd = _norm(str(args.get("command") or ""))
+            if _KILL_RE.search(cmd):
+                return "killing a core service (tailscaled / proxy / gateway / start.sh)"
+            if _RMROOT_RE.search(cmd):
+                return "deleting a top-level / workspace directory"
+            for seg in _SPLIT_RE.split(cmd):
+                why = _segment_violation(seg)
+                if why:
+                    return why
     return None
 
 
@@ -380,6 +548,12 @@ NUDGES = {
     ),
     "incomplete_stream": (
         "[hermes-guard] Your last reply was cut off by a broken connection. Repeat it completely."
+    ),
+    "send_file_unexplained": (
+        "[hermes-guard] You are about to send a file with NO explanation. The turn ENDS right after send_file - "
+        "your final text will never be produced or shown. In ONE response call the `message` tool FIRST with the "
+        "full explanation in the user's language and script (what was wrong / the goal, what you changed, how you "
+        "tested it and the real result, what is untested, how to run it), and `send_file` AFTER it."
     ),
     "no_explanation": (
         "[hermes-guard] The file was delivered, but you gave the user no explanation. " + _EXPLAIN_INSTRUCTION
@@ -433,8 +607,11 @@ def inject_reminder(payload, strong):
     return payload
 
 
-def append_nudge(payload, reason):
+def append_nudge(payload, reason, comp=None):
     text = NUDGES.get(reason)
+    if reason == "protected":
+        text = (f"[hermes-guard] BLOCKED: {(comp or {}).get('_violation', 'system change')}. "
+                "The owner has protected the server (app code, Tailscale, bot/API config). " + _DASH_HINT)
     if text:
         payload.setdefault("messages", []).append({"role": "user", "content": text})
 
@@ -561,12 +738,14 @@ class TypingKeeper:
         self._active = False
         self._last = 0.0
         self._off_at = 0.0
+        self._idle = max_idle
         self._thread = None
 
-    def touch(self):
-        """Agent is working (LLM request started/finished with tool calls)."""
+    def touch(self, idle=None):
+        """Agent is working (LLM request started/finished with tool calls). idle = how long to wait for the next request."""
         with self._lock:
             self._active = True
+            self._idle = idle or self.max_idle
             self._last = time.time()
             self._off_at = 0.0
             if self._thread is None or not self._thread.is_alive():
@@ -586,7 +765,7 @@ class TypingKeeper:
             if self._off_at and now >= self._off_at:
                 self._active = False
                 return False
-            if now - self._last > self.max_idle:
+            if now - self._last > self._idle:
                 self._active = False
                 return False
             return True
@@ -611,6 +790,7 @@ def _telegram_typing_sender():
     token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
     ids = [x.strip() for x in (os.environ.get("TELEGRAM_ALLOW_FROM") or "").split(",") if x.strip().lstrip("-").isdigit()]
     if not token or not ids:
+        log("typing keeper OFF: needs TELEGRAM_BOT_TOKEN and numeric ids in TELEGRAM_ALLOW_FROM")
         return None
     failed = {"n": 0}
 
@@ -705,7 +885,11 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
             if TYPING is not None:
                 TYPING.finish()               # request failed: do not leave "typing..." on
             try:
-                self._send_json(502, {"error": {"message": f"stream_proxy error: {exc}"}})
+                self._finish_ka()
+                if getattr(self, "_sse_open", False):
+                    self._sse_error(f"stream_proxy error: {exc}")
+                else:
+                    self._send_json(502, {"error": {"message": f"stream_proxy error: {exc}"}})
             except Exception:  # noqa: BLE001
                 pass
 
@@ -734,6 +918,45 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _open_sse(self):
+        if getattr(self, "_sse_open", False):
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self._sse_open = True
+
+    def _start_keepalive(self):
+        stop = threading.Event()
+        self._ka_stop = stop
+
+        def run():
+            while not stop.wait(KEEPALIVE_SECS):
+                try:
+                    self._open_sse()
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+                except Exception:  # noqa: BLE001
+                    return
+        self._ka_thread = threading.Thread(target=run, daemon=True)
+        self._ka_thread.start()
+
+    def _finish_ka(self):
+        stop = getattr(self, "_ka_stop", None)
+        if stop is not None:
+            stop.set()
+            t = getattr(self, "_ka_thread", None)
+            if t is not None:
+                t.join(timeout=2)
+            self._ka_stop = None
+
+    def _sse_error(self, text):
+        err = {"error": {"message": str(text)[:500], "type": "proxy_error"}}
+        self.wfile.write(f"data: {json.dumps(err, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8"))
+        self.wfile.flush()
+
     def _send_sse(self, comp):
         """Re-emit a validated chat.completion as an SSE stream for clients that asked for stream=true."""
         choice = comp["choices"][0]
@@ -753,17 +976,23 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
         chunks.append(dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason") or "stop"}]))
         if comp.get("usage"):
             chunks.append(dict(base, choices=[], usage=comp["usage"]))
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
+        self._finish_ka()
+        self._open_sse()
         for ch in chunks:
             self.wfile.write(f"data: {json.dumps(ch, ensure_ascii=False)}\n\n".encode("utf-8"))
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
     def _guarded_chat(self, target_url, payload, as_stream=False):
+        self._sse_open = False
+        if as_stream and KEEPALIVE_SECS > 0:
+            self._start_keepalive()
+        try:
+            self._guarded_chat_inner(target_url, payload, as_stream)
+        finally:
+            self._finish_ka()
+
+    def _guarded_chat_inner(self, target_url, payload, as_stream=False):
         payload["stream"] = True
         agent_turn = bool(payload.get("tools"))
         guard_on = GUARD and agent_turn
@@ -807,15 +1036,23 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
             if comp is None:                      # upstream error / non-completion: pass it on
                 if agent_turn and TYPING is not None:
                     TYPING.finish()
-                self._send_raw(resp, raw)
+                self._finish_ka()
+                if getattr(self, "_sse_open", False):          # 200 + keep-alives already sent: report in-band
+                    self._sse_error(raw[:300].decode("utf-8", "replace") if isinstance(raw, bytes) else raw)
+                else:
+                    self._send_raw(resp, raw)
                 return
             def _deliver(c):
                 ch0 = (c.get("choices") or [{}])[0]
                 if agent_turn and TYPING is not None:
-                    if (ch0.get("message") or {}).get("tool_calls"):
-                        TYPING.touch()      # tools will run now, next LLM call follows: stay "typing"
+                    calls = (ch0.get("message") or {}).get("tool_calls") or []
+                    names = {((x.get("function") or {}).get("name") or "") for x in calls}
+                    if calls and not (names & _TURN_ENDING_TOOLS):
+                        # tools run now, next LLM request follows: stay "typing". Long tools get a long wait,
+                        # quick ones (read/write file ...) a short one, so a dead turn never types for 12 min.
+                        TYPING.touch(idle=None if names & _SLOW_TOOLS else QUICK_TOOL_IDLE)
                     else:
-                        TYPING.finish()     # final answer
+                        TYPING.finish()     # final answer, or send_file (PicoClaw ends the turn after it)
                 if ch0.get("finish_reason") == "incomplete_stream":
                     ch0["finish_reason"] = "length"       # retries used up: tell PicoClaw it is cut, not finished
                 if as_stream:
@@ -843,15 +1080,24 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
             can_retry = (
                 reason is not None
                 and semantic_retries < BAD_REPLY_RETRIES
+                and not _expired(retry_deadline)          # a late answer after PicoClaw gave up is lost
                 and not (reason == "stalled" and stall_retried)
                 and reason != "no_choices"
             )
             if not can_retry:
+                if reason == "protected":     # retries used up: never let the blocked call through
+                    ch0 = comp["choices"][0]
+                    ch0["message"] = {"role": "assistant", "content":
+                        f"⛔ मी हे करू शकत नाही: {comp.get('_violation')}. सर्व्हर सिस्टम (app code, Tailscale, config) "
+                        "मालकाने protected ठेवली आहे. Dashboard live करायचा असेल तर मी `dash start` वापरतो; "
+                        "सिस्टम बदल हवा असेल तर तो तुम्हाला repo मध्ये करावा लागेल."}
+                    ch0["finish_reason"] = "stop"
+                comp.pop("_violation", None)
                 _deliver(comp)
                 return
             semantic_retries += 1
             stall_retried = stall_retried or reason == "stalled"
-            append_nudge(payload, reason)
+            append_nudge(payload, reason, comp)
             time.sleep(1.0)
 
     def do_GET(self):

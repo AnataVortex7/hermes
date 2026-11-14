@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -153,10 +154,10 @@ class ProxyTests(unittest.TestCase):
         # speed: the guard sleeps 1s between semantic retries
         self.mod.time.sleep = lambda s: None
 
-    def call(self, messages, tools=True, stream=False):
+    def call(self, messages, tools=True, stream=False, tool_names=("exec",)):
         body = {"model": "x", "messages": messages, "stream": stream}
         if tools:
-            body["tools"] = [{"type": "function", "function": {"name": "exec", "parameters": {}}}]
+            body["tools"] = [{"type": "function", "function": {"name": n, "parameters": {}}} for n in tool_names]
         req = urllib.request.Request(self.url, json.dumps(body).encode(), {"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=20) as r:
             raw = r.read()
@@ -389,6 +390,111 @@ class ProxyTests(unittest.TestCase):
         self.call(self.msg("summarize"), tools=False)
         self.assertFalse(k.is_on())
         self.assertEqual(sent, [])
+
+
+    # ---- system protection
+    def _tc(self, name, **a):
+        return [{"function": {"name": name, "arguments": json.dumps(a)}}]
+
+    def test_protection_blocks_system_changes_and_allows_workspace_work(self):
+        fv = self.mod.find_violation
+        for name, a in [("write_file", {"path": "/app/start.sh"}), ("edit_file", {"path": "~/.picoclaw/config.json"}),
+                        ("exec", {"command": "sed -i s/a/b/ /app/llm_proxy.py"}), ("exec", {"command": "echo x > /app/start.sh"}),
+                        ("exec", {"command": "tailscale serve reset"}), ("exec", {"command": "sudo tailscale up"}),
+                        ("exec", {"command": "pkill -f llm_proxy"}), ("exec", {"command": "rm -rf /root/.picoclaw"}),
+                        ("exec", {"command": "cp x /usr/local/bin/y"}), ("exec", {"command": "tailscaled &"})]:
+            self.assertTrue(fv(self._tc(name, **a)), (name, a))
+        for name, a in [("write_file", {"path": "/root/.picoclaw/workspace/dashboards/a/index.html"}),
+                        ("exec", {"command": "cat /app/start.sh | head"}), ("exec", {"command": "tailscale status"}),
+                        ("exec", {"command": "dash start live /root/.picoclaw/workspace/dashboards/live"}),
+                        ("exec", {"command": "python3 /app/notify.py hi"}), ("exec", {"command": "pip install requests"}),
+                        ("write_file", {"path": "/root/.picoclaw/workspace/app/x.py"})]:
+            self.assertIsNone(fv(self._tc(name, **a)), (name, a))
+
+    def test_blocked_tool_call_is_bounced_back_and_model_corrects_itself(self):
+        SCRIPT.extend([sse(*tool_chunks([(0, "c1", "write_file", '{"path":"/app/start.sh","content":"x"}')])),
+                       sse(*tool_chunks([(0, "c2", "exec", '{"command":"dash start live /root/.picoclaw/workspace/dashboards/live"}')]))])
+        _, raw = self.call(self.msg())
+        self.assertEqual(len(SEEN), 2)
+        self.assertIn("BLOCKED", SEEN[1]["messages"][-1]["content"])
+        self.assertIn("dash start", json.loads(raw)["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])
+
+    def test_blocked_call_never_reaches_picoclaw_when_retries_run_out(self):
+        bad = sse(*tool_chunks([(0, "c1", "exec", '{"command":"tailscale down"}')]))
+        SCRIPT.extend([bad, bad, bad, bad])
+        _, raw = self.call(self.msg())
+        msg = json.loads(raw)["choices"][0]["message"]
+        self.assertFalse(msg.get("tool_calls"))
+        self.assertIn("⛔", msg["content"])
+
+
+    # ---- PicoClaw ends the turn after send_file: explanation must be sent BEFORE it
+    LONG = "Root cause: the URL had a literal ${e}. Changed: build_url(). Tested: unit test passed. Run: python nvs_check.py " + "x" * 40
+    NAMES = ("exec", "message", "send_file")
+
+    def test_send_file_without_prior_message_is_bounced_and_model_adds_explanation(self):
+        SCRIPT.extend([sse(*tool_chunks([(0, "c1", "send_file", '{"path":"/w/a.py"}')])),
+                       sse(*tool_chunks([(0, "c2", "message", json.dumps({"content": self.LONG})),
+                                         (1, "c3", "send_file", '{"path":"/w/a.py"}')]))])
+        _, raw = self.call(self.msg(), tool_names=self.NAMES)
+        self.assertEqual(len(SEEN), 2)
+        self.assertIn("ENDS right after send_file", SEEN[1]["messages"][-1]["content"])
+        calls = json.loads(raw)["choices"][0]["message"]["tool_calls"]
+        self.assertEqual([c["function"]["name"] for c in calls], ["message", "send_file"])
+
+    def test_message_then_send_file_in_one_response_is_accepted(self):
+        SCRIPT.append(sse(*tool_chunks([(0, "c2", "message", json.dumps({"content": self.LONG})),
+                                        (1, "c3", "send_file", '{"path":"/w/a.py"}')])))
+        self.call(self.msg(), tool_names=self.NAMES)
+        self.assertEqual(len(SEEN), 1)
+
+    def test_send_file_accepted_when_explanation_was_sent_earlier_in_the_turn(self):
+        hist = [{"role": "user", "content": "fix it"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "m1", "type": "function", "function": {"name": "message", "arguments": json.dumps({"content": self.LONG})}}]},
+                {"role": "tool", "tool_call_id": "m1", "content": "sent"}]
+        SCRIPT.append(sse(*tool_chunks([(0, "c3", "send_file", '{"path":"/w/a.py"}')])))
+        self.call(hist, tool_names=self.NAMES)
+        self.assertEqual(len(SEEN), 1)
+
+    def test_typing_stops_when_turn_ends_with_send_file(self):
+        k, sent, t = self._fresh_keeper()
+        SCRIPT.append(sse(*tool_chunks([(0, "c2", "message", json.dumps({"content": self.LONG})),
+                                        (1, "c3", "send_file", '{"path":"/w/a.py"}')])))
+        self.call(self.msg(), tool_names=self.NAMES)
+        wait(0.5)
+        self.assertFalse(k.is_on())
+
+    def test_quick_tools_get_short_typing_idle_and_exec_gets_long(self):
+        k, sent, t = self._fresh_keeper()
+        SCRIPT.append(sse(*tool_chunks([(0, "c1", "read_file", '{"path":"/w/a"}')])))
+        self.call(self.msg(), tool_names=("read_file",))
+        self.assertEqual(k._idle, self.mod.QUICK_TOOL_IDLE)
+        SCRIPT.append(sse(*tool_chunks([(0, "c1", "exec", '{"command":"sleep 100"}')])))
+        self.call(self.msg(), tool_names=("exec",))
+        self.assertEqual(k._idle, k.max_idle)
+
+    def test_streaming_client_gets_keepalive_pings_while_reply_is_validated(self):
+        old = self.mod.KEEPALIVE_SECS
+        self.mod.KEEPALIVE_SECS = 0.2
+        self.addCleanup(setattr, self.mod, "KEEPALIVE_SECS", old)
+        SCRIPT.append(("slow_alive", text_chunks("done")))
+        _, raw = self.call(self.msg(), stream=True)
+        text = raw.decode()
+        self.assertIn(": keep-alive", text)
+        self.assertLess(text.index(": keep-alive"), text.index('"content": "done"'))
+        self.assertTrue(text.rstrip().endswith("[DONE]"))
+
+    def test_streaming_client_upstream_error_after_keepalive_is_reported_in_band(self):
+        old = self.mod.KEEPALIVE_SECS
+        self.mod.KEEPALIVE_SECS = 0.1
+        self.addCleanup(setattr, self.mod, "KEEPALIVE_SECS", old)
+        SCRIPT.extend([("status", 500)] * 6)
+        try:                                              # fast failure: plain HTTP 500 passed through (no keep-alive yet)
+            _, raw = self.call(self.msg(), stream=True)
+            self.assertIn(b"[DONE]", raw)                 # ...or, if pings already opened the stream, an in-band error
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 500)
 
 
     def test_upstream_error_is_passed_through_after_retries(self):

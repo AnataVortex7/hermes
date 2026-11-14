@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""tsports - publish EVERY TCP port this server listens on (PicoClaw gateway, web UI, dashboards, ...) to your Tailscale.
+
+Koyeb exposes only ONE public port, so everything else is reachable only through Tailscale.
+  tsports watch   (started by start.sh) scans listening ports every few seconds and publishes new ones
+                  with `tailscale serve --tcp=P`, un-publishes ports that stopped. Also serves an index page.
+  tsports list    what is listening / published, with URLs
+Open:  http://<TAILSCALE_HOSTNAME>:8099/  (index of all ports)   or   http://<hostname>:<port>/
+
+Env: TS_EXCLUDE_PORTS (default 1055,18799,22,53)  TS_MAX_PORT (default 32767: ephemeral ports are ignored)
+     TS_INTERVAL (default 5)  TS_INDEX_PORT (default 8099, 0 = no index page)  TS_SOCKET  TAILSCALE_HOSTNAME
+"""
+import html, http.server, json, os, socket, subprocess, sys, threading, time
+
+TS_SOCK = os.environ.get("TS_SOCKET", "/tmp/tailscale/tailscaled.sock")
+HOSTNAME = os.environ.get("TAILSCALE_HOSTNAME", "hermes")
+EXCLUDE = {int(x) for x in os.environ.get("TS_EXCLUDE_PORTS", "1055,18799,22,53").replace(" ", "").split(",") if x.isdigit()}
+MAX_PORT = int(os.environ.get("TS_MAX_PORT", "32767"))
+INTERVAL = float(os.environ.get("TS_INTERVAL", "5"))
+INDEX_PORT = int(os.environ.get("TS_INDEX_PORT", "8099"))
+GONE_AFTER = 3                      # scans a port must be missing before it is un-published
+
+
+def ts(*args, timeout=20):
+    return subprocess.run(["tailscale", f"--socket={TS_SOCK}", *args], capture_output=True, text=True, timeout=timeout)
+
+
+def _hex_addr(h):
+    ip, port = h.split(":")
+    if len(ip) == 8:                                   # IPv4, little-endian
+        a = ".".join(str(int(ip[i:i + 2], 16)) for i in (6, 4, 2, 0))
+    else:                                              # IPv6
+        a = "::" if set(ip) == {"0"} else "::1" if ip == "0" * 31 + "1" else "other6"
+    return a, int(port, 16)
+
+
+def listeners(files=("/proc/net/tcp", "/proc/net/tcp6")):
+    """{port: forward_ip} for every LISTENing TCP socket."""
+    out = {}
+    for fn in files:
+        try:
+            lines = open(fn).read().splitlines()[1:]
+        except OSError:
+            continue
+        for ln in lines:
+            f = ln.split()
+            if len(f) < 4 or f[3] != "0A":             # 0A = LISTEN
+                continue
+            addr, port = _hex_addr(f[1])
+            if addr in ("0.0.0.0", "::", "::1"):
+                fwd = "127.0.0.1"
+            elif addr == "other6":
+                continue
+            else:
+                fwd = addr
+            out.setdefault(port, fwd)
+    return out
+
+
+def wanted(ls):
+    return {p: ip for p, ip in ls.items() if 0 < p <= MAX_PORT and p not in EXCLUDE}
+
+
+def published():
+    try:
+        r = ts("serve", "status", "--json")
+        data = json.loads(r.stdout or "{}")
+        return {int(k): (v.get("TCPForward") or "") for k, v in (data.get("TCP") or {}).items()}
+    except Exception:
+        return {}
+
+
+def sync(run=ts, current=None, missing=None):
+    """One scan: publish new ports, un-publish gone ones. Returns {port: forward} that are published."""
+    now = wanted(listeners())
+    cur = published() if current is None else current
+    missing = {} if missing is None else missing
+    for p, ip in now.items():
+        missing.pop(p, None)
+        if p not in cur:
+            r = run("serve", "--bg", f"--tcp={p}", f"tcp://{ip}:{p}")
+            if r.returncode == 0:
+                cur[p] = f"{ip}:{p}"
+                print(f"[tsports] + {p} -> {ip}:{p}", flush=True)
+            else:
+                print(f"[tsports] could not publish {p}: {(r.stderr or r.stdout).strip()[:200]}", flush=True)
+    for p in list(cur):
+        if p in now or p == INDEX_PORT or p in EXCLUDE:
+            continue
+        # only un-publish what we publish ourselves (forward to local address); never touch foreign entries
+        if not cur[p].startswith(("127.", "10.", "172.", "192.168.")) and cur[p] != "":
+            continue
+        missing[p] = missing.get(p, 0) + 1
+        if missing[p] >= GONE_AFTER:
+            run("serve", f"--tcp={p}", "off")
+            cur.pop(p, None)
+            missing.pop(p, None)
+            print(f"[tsports] - {p} (stopped listening)", flush=True)
+    return cur
+
+
+def render_index(cur):
+    rows = []
+    for p in sorted(cur):
+        label = {10000: "keep-alive / memory / dashboard", 9119: "Hermes dashboard", 18790: "PicoClaw gateway health",
+                 18800: "PicoClaw web UI", INDEX_PORT: "this page"}.get(p, "")
+        u = f"http://{HOSTNAME}:{p}/"
+        rows.append(f"<tr><td><a href='{u}'>{p}</a></td><td>{html.escape(label)}</td><td><code>{u}</code></td></tr>")
+    return ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>Hermes ports</title><style>body{font:16px system-ui;margin:1.2rem}td,th{padding:.4rem .8rem;text-align:left}"
+            "a{font-weight:600}</style><h2>Hermes - ports on your Tailscale</h2>"
+            "<table><tr><th>Port</th><th>What</th><th>URL</th></tr>" + "".join(rows) + "</table>"
+            "<p>Non-HTTP ports (databases, SSH ...) will not open in a browser. Updates every few seconds - refresh.</p>")
+
+
+def start_index(state):
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = render_index(state["cur"]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", INDEX_PORT), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
+def cmd_watch():
+    for _ in range(120):                               # wait for tailscale to be up
+        try:
+            if ts("status", timeout=5).returncode == 0:
+                break
+        except Exception:
+            pass
+        time.sleep(2)
+    state = {"cur": {}}
+    if INDEX_PORT:
+        try:
+            start_index(state)
+        except OSError as e:
+            print(f"[tsports] index page not started: {e}", flush=True)
+    missing = {}
+    print(f"[tsports] watching listening ports (exclude {sorted(EXCLUDE)}, max {MAX_PORT})", flush=True)
+    while True:
+        try:
+            state["cur"] = sync(missing=missing)
+        except Exception as e:  # noqa: BLE001
+            print(f"[tsports] scan error: {e!r}", flush=True)
+        time.sleep(INTERVAL)
+
+
+def cmd_list():
+    now, cur = wanted(listeners()), published()
+    print(f"{'PORT':<7}{'LISTENING':<11}{'ON TAILSCALE':<14}URL")
+    for p in sorted(set(now) | set(cur)):
+        print(f"{p:<7}{'yes' if p in now else 'no':<11}{'yes' if p in cur else 'no':<14}http://{HOSTNAME}:{p}/")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "watch":
+        cmd_watch()
+    elif len(sys.argv) > 1 and sys.argv[1] == "list":
+        cmd_list()
+    else:
+        print(__doc__)
