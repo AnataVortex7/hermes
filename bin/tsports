@@ -111,7 +111,7 @@ def sync(run=ts, current=None, missing=None):
 def render_index(cur):
     rows = []
     for p in sorted(cur):
-        label = {10000: "keep-alive / memory / dashboard", 9119: "Hermes dashboard", 18790: "PicoClaw gateway health",
+        label = {10000: "keep-alive / live stats / PicoClaw status", 18790: "PicoClaw gateway health",
                  18800: "PicoClaw web UI", INDEX_PORT: "this page"}.get(p, "")
         u = f"http://{HOSTNAME}:{p}/"
         rows.append(f"<tr><td><a href='{u}'>{p}</a></td><td>{html.escape(label)}</td><td><code>{u}</code></td></tr>")

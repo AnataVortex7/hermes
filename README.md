@@ -1,6 +1,6 @@
-# hermes – PicoClaw + Telegram on Koyeb
+# hermes – PicoClaw + Telegram (Render / Koyeb / any container host)
 
-Container runs `keep_alive.py` (health/dashboard on port 10000) and
+Container runs `keep_alive.py` (health, live stats and the PicoClaw route on port 10000) and
 **PicoClaw** (`picoclaw gateway`) connected to a Telegram bot via long polling.
 
 ## Koyeb environment variables
@@ -22,8 +22,22 @@ Container runs `keep_alive.py` (health/dashboard on port 10000) and
 `~/.picoclaw/config.json` is rebuilt from these on every boot and is **not**
 backed up to Drive (it contains secrets). Sessions/memory/workspace are.
 
-## Pin a PicoClaw version
-`docker build --build-arg PICOCLAW_VERSION=v0.3.1 .`
+## PicoClaw version is pinned
+The Dockerfile installs a fixed release (`ARG PICOCLAW_VERSION=v0.3.1`) from
+`github.com/<repo>/releases/download/<tag>/...`, so restarts and redeploys always give the same binary
+(`cat /etc/picoclaw-version`). `latest` is rejected on purpose. To upgrade, change that one line and redeploy.
+
+## Live "Agent is working" status (Telegram)
+While a job runs, the proxy keeps ONE message updated: `⚙️ Agent is working… / 🔧 exec / Step 12 · 14m`.
+It shows the short name of the tool the model just called (`🧠 Thinking… (last: exec)` while it waits for the LLM),
+the step count and elapsed time (minutes change every minute, so a 3-hour job visibly stays alive).
+When the job ends the message is deleted; if there is no activity for `TYPING_MAX_IDLE` (12 min) it becomes a warning and stays.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `STATUS_MESSAGE` | `1` | `0` = only the typing indicator |
+| `STATUS_MIN_INTERVAL` | `3` | min seconds between edits |
+| `STATUS_DELETE_ON_FINISH` | `1` | `0` = keep it as `✅ Agent finished (Nm)` |
 
 ## Custom OpenAI-compatible API
 Set these env vars (model must keep the `openai/` prefix):
@@ -41,13 +55,13 @@ Runs in the background in userspace mode (no TUN / NET_ADMIN needed on Koyeb).
 |---|---|
 | `TAILSCALE_AUTHKEY` | Tailscale admin -> Settings -> Keys -> Generate auth key. Tick **Reusable** and **Ephemeral** (state is in RAM, so every deploy would otherwise leave a stale device behind) |
 | `TAILSCALE_HOSTNAME` | optional, default `hermes` |
-| `TAILSCALE_PORTS` | optional, default `10000,9119,18790,18800` - local ports forwarded to your tailnet |
+| `TAILSCALE_PORTS` | optional, default `10000,18790,18800` - local ports forwarded to your tailnet |
 
 Install the Tailscale app on your phone, log in to the same account, then open
 `http://hermes:10000/memory` (or `http://<100.x.y.z>:10000/memory`; the IP is
 printed in the Koyeb logs as `[tailscale] connected, IPv4: ...`).
 
-Port 10000 = keep_alive (`/memory`, `/dashboard`), 9119 = Hermes dashboard,
+Port 10000 = keep_alive (`/memory` live stats, `/picoclaw` PicoClaw route),
 18790 = PicoClaw gateway health, 18800 = PicoClaw web UI (only if something listens there).
 
 ## Debugging the model
@@ -156,7 +170,7 @@ a determined obfuscated command could slip through. Real isolation = run the gat
 
 ## All ports on Tailscale (`tsports`)
 Koyeb exposes only one public port (10000). `bin/tsports watch` (started by `start.sh` right after Tailscale connects) scans every 5 s for
-TCP ports the server listens on (PicoClaw gateway 18790, web UI 18800, Hermes dashboard 9119, `hdash` dashboards 81xx, anything new) and publishes
+TCP ports the server listens on (PicoClaw gateway 18790, web UI 18800, `hdash` dashboards 81xx, anything new) and publishes
 each with `tailscale serve --tcp=<port>`; ports that stop listening are removed after ~15 s. An index page with clickable links is on
 `http://hermes:8099/`; `tsports list` prints the same in the shell. Excluded by default: 1055 (Tailscale SOCKS), 18799 (LLM proxy, holds the API key), 22, 53 and ports above 32767 (ephemeral).
 Env: `TS_EXCLUDE_PORTS`, `TS_MAX_PORT`, `TS_INTERVAL`, `TS_INDEX_PORT` (0 = off). Non-HTTP ports are forwarded too but only open in a browser if they speak HTTP.
@@ -186,3 +200,15 @@ Protocol: "continue" resumes from `tasks/current.md`; a text-only reply ends the
 - `500/502` retry only `LLM_SERVER_ERROR_RETRIES` (8) times (usually deterministic -> you hear about it early); `429/503`/connection errors keep retrying until the budget is used.
 - The "explain before send_file" rule applies only when work was done in the turn (write/edit/exec/...); a plain "send me that file" is not blocked or slowed.
 - `tsports`: if `tailscale serve status --json` fails it no longer re-publishes every port on every scan.
+
+## Live stats are now real (`/memory`, `/api/stats`) + `/picoclaw` route
+**Why the old numbers were fake:** inside a container `/proc/meminfo`, `/proc/stat`, `/proc/loadavg` and `/proc/uptime` describe the whole *host*. The old page showed host memory against a hard-coded 512 MB, host CPU multiplied by 10, host load average, host uptime and `ps` %mem relative to host RAM.
+**Now (`sysstats.py`)**, from the container's own cgroup:
+- **RAM**: working set = `memory.current` minus reclaimable page cache (what the OOM killer judges), limit from `memory.max`; also page cache, peak, and **OOM-kill count** (`memory.events`) - a red warning appears if a process was ever killed for memory.
+- **CPU**: real usage from `cpu.stat`/`cpuacct.usage` as % of your allotment (cgroup quota, e.g. 0.1 vCPU), avg 1m/5m/15m, and **throttled %** (how much the host held your process back).
+- **Processes**: RSS in MB and CPU % of your limit per process (only this container's PIDs). **Uptime** = container uptime (host uptime minus PID 1 start).
+- **Disk**: exact `du -x` of `/root`, `/app`, `/tmp` (your data), refreshed every minute in a background thread.
+- If the host hides the cgroup, RAM falls back to the sum of process RSS and CPU to the sum of process CPU time; the page footer states the `source` and where each limit came from.
+**Set your plan's allotment** (a container cannot always read it): `RAM_LIMIT_MB` (default: cgroup limit, else 512), `CPU_LIMIT` in cores (default: cgroup quota, else 0.1), `DISK_LIMIT_MB` (default 2000). The disk limit is never visible from inside, so set it to what your plan gives.
+Slow work (disk scan, process scan) is in a background thread and the server is threaded, so the platform health check on `/` can no longer be blocked by a stats request.
+**`/picoclaw`** replaces the old `/dashboard` (it forwarded to a Hermes dashboard on 9119 that nothing starts any more; removed). `/picoclaw` shows the PicoClaw web UI if something listens on `PICOCLAW_UI_PORT` (18800) - links are rewritten best-effort, WebSockets are not supported through this route (use Tailscale `:18800` for those) - otherwise a built-in status page (gateway `/ready` + `/health`, LLM guard proxy, UI up/down); `/picoclaw/status.json` is the same as JSON. The route is **public** unless you set `UI_BASIC_AUTH=user:password`.

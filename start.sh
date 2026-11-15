@@ -66,7 +66,7 @@ if [ -n "$TAILSCALE_AUTHKEY" ] && command -v tailscaled >/dev/null 2>&1; then
     if timeout 90 $TS up --auth-key="$TAILSCALE_AUTHKEY" \
          --hostname="${TAILSCALE_HOSTNAME:-hermes}" --accept-dns=false; then
       echo ">> [tailscale] connected, IPv4: $($TS ip -4 2>/dev/null | head -n1)"
-      for p in $(echo "${TAILSCALE_PORTS:-10000,9119,18790,18800}" | tr ',' ' '); do
+      for p in $(echo "${TAILSCALE_PORTS:-10000,18790,18800}" | tr ',' ' '); do
         if $TS serve --bg --tcp="$p" "tcp://127.0.0.1:$p" >/dev/null 2>&1; then
           echo ">> [tailscale] forwarding tailnet port $p -> 127.0.0.1:$p"
         else

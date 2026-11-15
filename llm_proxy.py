@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -926,6 +927,171 @@ if TYPING_ENABLED:
                               max_idle=_env_float("TYPING_MAX_IDLE", 720.0))
 
 
+# --------------------------------------------------------------------------- live status message
+def short_tool_name(name, limit=24):
+    """`mcp__server__web_search` -> `web_search`; long names are cut so the status line stays short."""
+    name = (name or "?").strip().split("__")[-1] or "?"
+    return name if len(name) <= limit else name[:limit - 1] + "…"
+
+
+class _Turn:
+    def __init__(self):
+        self.started = time.time()
+        self.steps = 0
+        self.phase = "thinking"       # thinking = waiting for the LLM, tool = tools are running
+        self.names = []
+        self.last_tools = []
+        self.finish_at = 0.0          # explicit finish (final answer); cancelled by a new request within the linger
+        self.stalled = False
+        self.done = threading.Event()
+        self.msg_ids = {}             # chat id -> telegram message id
+
+
+class StatusMessage:
+    """One Telegram message per job: "Agent is working" + the tool it is running right now.
+
+    "typing..." alone says nothing during a 2-4 hour job, so it looks like the bot crashed. This proxy sees every
+    LLM request and every tool call the model asks for, so it keeps ONE message up to date (editMessageText) with the
+    short tool name, step number and elapsed minutes. When the job ends the message is deleted (the real answer is
+    the only thing left in the chat); if nothing happens for too long it turns into a warning and stays.
+    """
+
+    def __init__(self, call, ids, min_interval=3.0, linger=3.0, delete_on_finish=True, stall_after=None):
+        self.call = call                  # call(method, **params) -> dict (Telegram Bot API)
+        self.ids = ids
+        self.min_interval = min_interval
+        self.linger = linger
+        self.delete_on_finish = delete_on_finish
+        self.stall_after = stall_after    # callable -> True when the turn is dead (typing keeper expired)
+        self._lock = threading.Lock()
+        self._turn = None
+
+    # -- called by the proxy
+    def begin(self):
+        """An agent LLM request starts (new job, or the next step of the running one)."""
+        with self._lock:
+            t = self._turn
+            if t is not None and not t.done.is_set():
+                t.finish_at = 0.0
+                t.phase = "thinking"
+                return
+            t = self._turn = _Turn()
+        threading.Thread(target=self._run, args=(t,), daemon=True).start()
+
+    def tools(self, names):
+        with self._lock:
+            t = self._turn
+            if t is None or t.done.is_set():
+                return
+            t.finish_at = 0.0
+            t.phase = "tool"
+            t.names = [short_tool_name(n) for n in names][:3]
+            t.last_tools = t.names
+            t.steps += max(len(names), 1)
+
+    def finish(self):
+        with self._lock:
+            t = self._turn
+            if t is not None and not t.done.is_set():
+                t.finish_at = time.time() + self.linger
+
+    # -- rendering
+    @staticmethod
+    def render(t, now=None):
+        mins = int(((now or time.time()) - t.started) // 60)
+        if t.phase == "tool" and t.names:
+            line = "🔧 " + " + ".join(t.names)
+        elif t.last_tools:
+            line = "🧠 Thinking… (last: " + " + ".join(t.last_tools) + ")"
+        else:
+            line = "🧠 Thinking…"
+        h, m = divmod(mins, 60)
+        elapsed = f"{h}h {m}m" if h else f"{m}m"
+        return f"⚙️ Agent is working…\n{line}\nStep {t.steps} · {elapsed}"
+
+    # -- telegram plumbing (never raises)
+    def _api(self, method, **params):
+        try:
+            return self.call(method, **params) or {}
+        except Exception as exc:  # noqa: BLE001
+            log(f"status {method} failed: {exc!r}")
+            return {}
+
+    def _push(self, t, text):
+        for cid in self.ids:
+            mid = t.msg_ids.get(cid)
+            if mid:
+                r = self._api("editMessageText", chat_id=cid, message_id=mid, text=text)
+                if r.get("ok") or "not modified" in str(r.get("description", "")):
+                    continue
+                if r.get("parameters", {}).get("retry_after"):
+                    time.sleep(min(int(r["parameters"]["retry_after"]), 30))
+                    continue
+                t.msg_ids.pop(cid, None)          # message gone (user deleted it): send a fresh one below
+            r = self._api("sendMessage", chat_id=cid, text=text, disable_notification=True)
+            if r.get("ok"):
+                t.msg_ids[cid] = r["result"]["message_id"]
+
+    def _run(self, t):
+        shown = ""
+        last_edit = 0.0
+        while True:
+            now = time.time()
+            with self._lock:
+                if t.finish_at and now >= t.finish_at:
+                    break
+                text = self.render(t, now)
+            if self.stall_after is not None and not t.finish_at and self.stall_after():
+                with self._lock:
+                    t.stalled = True
+                break
+            if text != shown and now - last_edit >= self.min_interval:
+                self._push(t, text)
+                shown, last_edit = text, time.time()
+            t.done.wait(0.5)
+        with self._lock:
+            t.done.set()
+            mins = int((time.time() - t.started) // 60)
+            last = " + ".join(t.last_tools) or "-"
+            stalled = t.stalled
+        for cid, mid in list(t.msg_ids.items()):
+            if stalled:
+                self._api("editMessageText", chat_id=cid, message_id=mid, text=(
+                    f"⚠️ Agent कडून बराच वेळ काहीही activity नाही (last: {last}, {mins}m नंतर). "
+                    "काम थांबलं असू शकतं — 'continue' पाठवा."))
+            elif self.delete_on_finish:
+                r = self._api("deleteMessage", chat_id=cid, message_id=mid)
+                if not r.get("ok"):
+                    self._api("editMessageText", chat_id=cid, message_id=mid, text=f"✅ Agent finished ({mins}m)")
+            else:
+                self._api("editMessageText", chat_id=cid, message_id=mid, text=f"✅ Agent finished ({mins}m)")
+
+
+def _telegram_api_caller(token):
+    def call(method, **params):
+        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}",
+                                     data=json.dumps(params).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            return json.loads(urllib.request.urlopen(req, timeout=10).read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:      # 400 "message is not modified", 429 retry_after ... carry a JSON body
+            try:
+                return json.loads(exc.read().decode("utf-8"))
+            except Exception:  # noqa: BLE001
+                return {"ok": False, "description": f"HTTP {exc.code}"}
+    return call
+
+
+STATUS = None
+if TYPING is not None and os.environ.get("STATUS_MESSAGE", "1").strip() != "0":
+    _tok = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    _ids = [x.strip() for x in (os.environ.get("TELEGRAM_ALLOW_FROM") or "").split(",") if x.strip().lstrip("-").isdigit()]
+    STATUS = StatusMessage(_telegram_api_caller(_tok), _ids,
+                           min_interval=_env_float("STATUS_MIN_INTERVAL", 3.0),
+                           delete_on_finish=(os.environ.get("STATUS_DELETE_ON_FINISH", "1").strip() != "0"),
+                           stall_after=lambda: TYPING is not None and not TYPING.is_on())
+
+
 # --------------------------------------------------------------------------- handler
 class GuardProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -993,6 +1159,8 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             if TYPING is not None:
                 TYPING.finish()               # request failed: do not leave "typing..." on
+                if STATUS is not None:
+                    STATUS.finish()
             log(f"request failed: {exc!r}")
             notify_owner(f"⚠️ LLM request fail झाला: {str(exc)[:200]}. काम थांबलं असू शकतं — 'continue' पाठवा.")
             try:
@@ -1121,6 +1289,8 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
 
         if agent_turn and TYPING is not None:
             TYPING.touch()                  # turn started / continues after a tool: keep "typing..." on
+            if STATUS is not None:
+                STATUS.begin()
         semantic_retries = 0
         read_failures = 0
         call_started = time.time()
@@ -1131,6 +1301,8 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
             hard_deadline = min(started + TIMEOUT, call_started + TOTAL_BUDGET)   # per attempt, never past the budget
             if agent_turn and TYPING is not None:
                 TYPING.touch()
+                if STATUS is not None:
+                    STATUS.begin()
             body = json.dumps(payload).encode("utf-8")
             conn, resp = open_upstream("POST", target_url, self._forward_headers(body), body, retry_deadline)
             try:
@@ -1148,6 +1320,8 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
             if comp is None:                      # upstream error / non-completion: pass it on
                 if agent_turn and TYPING is not None:
                     TYPING.finish()
+                    if STATUS is not None:
+                        STATUS.finish()
                 if agent_turn:
                     notify_owner(f"⚠️ LLM API ने error दिला (HTTP {getattr(resp, 'status', '?')}) — retries नंतरही. "
                                  f"काम मधेच थांबलं असू शकतं. 'continue' पाठवा, मी tasks/current.md वरून पुढे चालू करतो.")
@@ -1166,8 +1340,12 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
                         # tools run now, next LLM request follows: stay "typing". Long tools get a long wait,
                         # quick ones (read/write file ...) a short one, so a dead turn never types for 12 min.
                         TYPING.touch(idle=None if names & _SLOW_TOOLS else QUICK_TOOL_IDLE)
+                        if STATUS is not None:
+                            STATUS.tools([(x.get("function") or {}).get("name") or "?" for x in calls])
                     else:
                         TYPING.finish()     # final answer, or send_file (PicoClaw ends the turn after it)
+                        if STATUS is not None:
+                            STATUS.finish()
                 if ch0.get("finish_reason") == "incomplete_stream":
                     ch0["finish_reason"] = "length"       # retries used up: tell PicoClaw it is cut, not finished
                 if as_stream:

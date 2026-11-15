@@ -7,23 +7,23 @@ RUN apt-get update && apt-get install -y curl git sudo bash unzip libatomic1 ca-
     curl https://rclone.org/install.sh | bash && \
     rm -rf /var/lib/apt/lists/*
 
-# PicoClaw (single static Go binary, very low RAM) - pick the asset for this CPU
-# straight from the latest GitHub release, so no asset name is hardcoded.
-ARG PICOCLAW_VERSION=latest
+# PicoClaw (single static Go binary, very low RAM) - PINNED version, so every rebuild/restart/redeploy gets
+# exactly the same binary. Downloaded straight from the release URL: no GitHub API call (no rate limit, no JSON parsing).
+# To move to another version change ONLY this line (or --build-arg PICOCLAW_VERSION=vX.Y.Z), after reading the release notes.
+ARG PICOCLAW_VERSION=v0.3.1
 RUN set -e; \
     case "$(uname -m)" in \
-      x86_64)  ARCH_RE='(x86_64|amd64)' ;; \
-      aarch64) ARCH_RE='(arm64|aarch64)' ;; \
+      x86_64)  ASSET=picoclaw_Linux_x86_64.tar.gz ;; \
+      aarch64) ASSET=picoclaw_Linux_arm64.tar.gz ;; \
       *) echo "unsupported arch $(uname -m)"; exit 1 ;; \
     esac; \
-    if [ "$PICOCLAW_VERSION" = "latest" ]; then API=https://api.github.com/repos/sipeed/picoclaw/releases/latest; \
-    else API=https://api.github.com/repos/sipeed/picoclaw/releases/tags/$PICOCLAW_VERSION; fi; \
-    URL=$(curl -fsSL "$API" | grep -o '"browser_download_url": *"[^"]*"' | cut -d'"' -f4 \
-          | grep -i linux | grep -Ei "$ARCH_RE" | grep -E '\.tar\.gz$' | head -n1); \
-    test -n "$URL"; echo "Installing PicoClaw from $URL"; \
-    mkdir -p /tmp/pc && curl -fsSL "$URL" | tar -xz -C /tmp/pc; \
+    case "$PICOCLAW_VERSION" in latest|"") echo "PICOCLAW_VERSION must be a fixed tag like v0.3.1, not 'latest'"; exit 1 ;; esac; \
+    URL="https://github.com/sipeed/picoclaw/releases/download/${PICOCLAW_VERSION}/${ASSET}"; \
+    echo "Installing PicoClaw ${PICOCLAW_VERSION} from $URL"; \
+    mkdir -p /tmp/pc && curl -fsSL --retry 5 --retry-delay 3 "$URL" | tar -xz -C /tmp/pc; \
     install -m 0755 "$(find /tmp/pc -type f -name picoclaw | head -n1)" /usr/local/bin/picoclaw; \
-    rm -rf /tmp/pc; picoclaw --help >/dev/null 2>&1 || true
+    rm -rf /tmp/pc; echo "$PICOCLAW_VERSION" > /etc/picoclaw-version; \
+    picoclaw --help >/dev/null 2>&1 || true
 
 # Playwright + Chromium, baked into the image (so it survives restarts).
 # --with-deps pulls the system libs Chromium needs.
@@ -39,6 +39,7 @@ COPY --from=tailscale /usr/local/bin/tailscale /usr/local/bin/tailscale
 WORKDIR /app
 
 COPY keep_alive.py /app/keep_alive.py
+COPY sysstats.py /app/sysstats.py
 COPY start.sh /app/start.sh
 COPY setup_picoclaw.py /app/setup_picoclaw.py
 COPY llm_proxy.py /app/llm_proxy.py

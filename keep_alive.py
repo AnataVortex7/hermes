@@ -1,24 +1,50 @@
 import http.server
+import base64
 import json
 import os
-import subprocess
-import time
+import re
+import socket
 import threading
-import urllib.request
 import urllib.error
+import urllib.request
 
-last_cpu_times = [0, 0]
+from sysstats import Stats
 
-STATS_CACHE_SECONDS = int(os.environ.get("STATS_CACHE_SECONDS", "10"))
-_stats_cache = {"time": 0.0, "data": None}
+# ── Accurate container stats (cgroup based, see sysstats.py) ──
+STATS = Stats()
+STATS.start()
 
-# ── Dashboard reverse-proxy settings ──
-# Hermes dashboard 127.0.0.1:9119 वर (loopback-only, no auth needed) चालतो.
-# Koyeb फक्त एकच public port (PORT / 10000) expose करतो, म्हणून /dashboard
-# खालचे सगळे requests इथून 9119 ला forward करतो.
-DASHBOARD_HOST = "127.0.0.1"
-DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "9119"))
-DASHBOARD_PREFIX = "/dashboard"
+
+def get_stats():
+    snap = STATS.snapshot()
+    snap["platform"] = _platform()
+    snap["startup"] = get_startup_phase()
+    return snap
+
+
+def _platform():
+    env = os.environ
+    if env.get("RENDER"):
+        return "Render"
+    if env.get("KOYEB_SERVICE_NAME") or env.get("KOYEB_APP_NAME"):
+        return "Koyeb"
+    if env.get("FLY_APP_NAME"):
+        return "Fly.io"
+    return "Container"
+
+
+# ── PicoClaw route ──
+# /picoclaw        -> PicoClaw web UI on 127.0.0.1:PICOCLAW_UI_PORT (18800) if something listens there,
+#                     otherwise a built-in status page (gateway health/ready + LLM proxy).
+# /picoclaw/status.json -> same status as JSON.
+# Only ONE public port is exposed by the host, so everything is reached through this server.
+# Optional protection: UI_BASIC_AUTH="user:password" (recommended - the route is public otherwise).
+PICOCLAW_PREFIX = "/picoclaw"
+PICOCLAW_HOST = "127.0.0.1"
+PICOCLAW_UI_PORT = int(os.environ.get("PICOCLAW_UI_PORT", "18800"))
+PICOCLAW_HEALTH_PORT = int(os.environ.get("PICOCLAW_HEALTH_PORT", "18790"))
+LLM_PROXY_PORT = int(os.environ.get("LOCAL_LLM_PROXY_PORT", "18799"))
+UI_BASIC_AUTH = os.environ.get("UI_BASIC_AUTH", "").strip()
 
 HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -26,134 +52,91 @@ HOP_BY_HOP_HEADERS = {
 }
 
 # ── Startup state — gateway ला signal करायला वापरतो ──
-# "waiting"  : Drive restore अजून चालू आहे
-# "ready"    : Restore झालं, gateway restart झालं
+# "waiting" : Drive restore अजून चालू आहे
+# "ready"   : Restore झालं, gateway restart झालं
 _startup_state = {"phase": "waiting", "message": "Restoring state from Google Drive..."}
 _startup_lock = threading.Lock()
+
 
 def set_startup_ready():
     with _startup_lock:
         _startup_state["phase"] = "ready"
         _startup_state["message"] = "Hermes is fully operational."
 
+
 def get_startup_phase():
     with _startup_lock:
         return _startup_state.copy()
 
-def get_cpu():
-    global last_cpu_times
+
+def port_open(port, timeout=0.5):
     try:
-        with open('/proc/stat') as f:
-            line = f.readline()
-        fields = [float(x) for x in line.strip().split()[1:]]
-        idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
-        total = sum(fields)
-        diff_total = total - last_cpu_times[0]
-        diff_idle = idle - last_cpu_times[1]
-        last_cpu_times[0] = total
-        last_cpu_times[1] = idle
-        if diff_total > 0:
-            return min(100.0, round(100.0 * (1.0 - (diff_idle / diff_total)) * 10.0, 1))
-    except Exception:
-        pass
-    return 0.0
+        with socket.create_connection((PICOCLAW_HOST, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
-def get_stats():
-    now = time.time()
-    if _stats_cache["data"] is not None and (now - _stats_cache["time"]) < STATS_CACHE_SECONDS:
-        return _stats_cache["data"]
-    data = _compute_stats()
-    _stats_cache["time"] = now
-    _stats_cache["data"] = data
-    return data
 
-def _compute_stats():
-    total_mem = 512.0
-    used_mem = 350.0
+def _fetch(port, path, timeout=2):
     try:
-        with open('/proc/meminfo') as f:
-            mem_info = {}
-            for line in f:
-                parts = line.split(':')
-                if len(parts) == 2:
-                    mem_info[parts[0].strip()] = int(parts[1].strip().split()[0])
-            total_kb = mem_info.get('MemTotal', 512 * 1024)
-            avail_kb = mem_info.get('MemAvailable', mem_info.get('MemFree', 0))
-            used_kb = total_kb - avail_kb
-            used_mem = round(used_kb / 1024, 1)
-    except Exception:
-        pass
+        with urllib.request.urlopen(f"http://{PICOCLAW_HOST}:{port}{path}", timeout=timeout) as r:
+            body = r.read(4000).decode("utf-8", "replace")
+            return r.status, body
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except Exception:  # noqa: BLE001
+        return None, ""
 
-    mem_percent = round((used_mem / total_mem) * 100, 1)
-    total_disk_mb = 2000.0
-    used_mb = 0.0
-    try:
-        result = subprocess.check_output(['du', '-sm', '/root', '/app']).decode('utf-8')
-        used_mb = sum(int(line.split()[0]) for line in result.splitlines())
-    except Exception:
-        pass
 
-    disk_percent = round((used_mb / total_disk_mb) * 100, 1)
-    cpu_percent = get_cpu()
-
-    load_avg = [0.0, 0.0, 0.0]
-    try:
-        with open('/proc/loadavg') as f:
-            load_avg = [float(x) for x in f.read().split()[:3]]
-    except Exception:
-        pass
-
-    uptime_str = "0h 0m"
-    try:
-        with open('/proc/uptime') as f:
-            uptime_seconds = float(f.read().split()[0])
-            hours = int(uptime_seconds // 3600)
-            minutes = int((uptime_seconds % 3600) // 60)
-            uptime_str = f"{hours}h {minutes}m"
-    except Exception:
-        pass
-
-    processes = []
-    try:
-        ps_out = subprocess.check_output(['ps', '-eo', 'pid,comm,%mem,%cpu', '--sort=-%mem']).decode('utf-8').splitlines()
-        for line in ps_out[1:8]:
-            parts = line.split()
-            if len(parts) >= 4:
-                processes.append({'pid': parts[0], 'command': parts[1], 'mem': parts[2], 'cpu': parts[3]})
-    except Exception:
-        pass
-
-    phase_info = get_startup_phase()
-
+def picoclaw_status():
+    h_code, h_body = _fetch(PICOCLAW_HEALTH_PORT, "/health")
+    r_code, r_body = _fetch(PICOCLAW_HEALTH_PORT, "/ready")
     return {
-        "memory": {"total_mb": 512, "used_mb": used_mem, "free_mb": max(0, round(512 - used_mem, 1)), "percent": min(100.0, mem_percent)},
-        "disk": {"total_mb": 2000, "used_mb": used_mb, "free_mb": max(0, round(2000 - used_mb, 1)), "percent": min(100.0, disk_percent)},
-        "cpu": {"percent": cpu_percent, "load_avg": load_avg},
-        "uptime": uptime_str,
-        "processes": processes,
-        "startup": phase_info
+        "gateway_listening": port_open(PICOCLAW_HEALTH_PORT),
+        "health": {"http": h_code, "body": h_body.strip()[:500]},
+        "ready": {"http": r_code, "body": r_body.strip()[:500]},
+        "ready_ok": r_code == 200,
+        "llm_proxy_listening": port_open(LLM_PROXY_PORT),
+        "web_ui_listening": port_open(PICOCLAW_UI_PORT),
+        "web_ui_port": PICOCLAW_UI_PORT,
     }
 
-# ── Startup banner — /memory page वर दाखवतो ──
+
+STATUS_PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>PicoClaw status</title>
+<style>
+body{background:#0f172a;color:#f8fafc;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:20px;max-width:760px;margin:0 auto}
+h1{color:#38bdf8;font-size:22px}.card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px;margin:14px 0}
+.ok{color:#34d399}.bad{color:#f43f5e}.muted{color:#94a3b8;font-size:13px}pre{white-space:pre-wrap;word-break:break-word;color:#cbd5e1;font-size:12px}
+a{color:#38bdf8}
+</style></head><body>
+<h1>🦞 PicoClaw</h1><div class="muted"><a href="/memory">← Live stats</a></div>
+<div class="card"><div>Gateway: <b id="gw">...</b></div><div>LLM guard proxy: <b id="px">...</b></div>
+<div>Web UI (port <span id="uip">?</span>): <b id="ui">...</b></div></div>
+<div class="card"><div class="muted">/ready</div><pre id="ready">...</pre><div class="muted">/health</div><pre id="health">...</pre></div>
+<div class="muted" id="hint"></div>
+<script>
+function set(id,ok,t){var e=document.getElementById(id);e.textContent=t;e.className=ok?'ok':'bad';}
+function upd(){fetch('/picoclaw/status.json').then(function(r){return r.json()}).then(function(s){
+ set('gw',s.ready_ok,s.ready_ok?'ready ✅':(s.gateway_listening?'running, not ready yet':'not running ❌'));
+ set('px',s.llm_proxy_listening,s.llm_proxy_listening?'up ✅':'down ❌');
+ set('ui',s.web_ui_listening,s.web_ui_listening?'up ✅ (reload this page to open it)':'not running');
+ document.getElementById('uip').textContent=s.web_ui_port;
+ document.getElementById('ready').textContent='HTTP '+s.ready.http+'  '+s.ready.body;
+ document.getElementById('health').textContent='HTTP '+s.health.http+'  '+s.health.body;
+ document.getElementById('hint').textContent=s.web_ui_listening?'':'No PicoClaw web UI is listening here. Start it on this port and this route will show it automatically.';
+}).catch(function(){});}
+setInterval(upd,3000);upd();
+</script></body></html>"""
+
+
+# ── /memory page ──
 STARTUP_BANNER = """
-<div id="startup-banner" style="
-    background: linear-gradient(135deg, #1e3a5f, #0f2744);
-    border: 1px solid #38bdf8;
-    border-radius: 12px;
-    padding: 20px 24px;
-    margin-bottom: 20px;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-">
-  <div style="font-size: 32px;">⏳</div>
+<div id="startup-banner" style="background:linear-gradient(135deg,#1e3a5f,#0f2744);border:1px solid #38bdf8;border-radius:12px;padding:20px 24px;margin-bottom:20px;display:flex;align-items:center;gap:16px;">
+  <div style="font-size:32px;">⏳</div>
   <div>
-    <div style="color: #38bdf8; font-weight: 700; font-size: 16px;" id="banner-title">
-      Restoring from Google Drive...
-    </div>
-    <div style="color: #94a3b8; font-size: 13px; margin-top: 4px;" id="banner-sub">
-      Hermes history, skills, and state are being restored. Gateway will start automatically once ready.
-    </div>
+    <div style="color:#38bdf8;font-weight:700;font-size:16px;" id="banner-title">Restoring from Google Drive...</div>
+    <div style="color:#94a3b8;font-size:13px;margin-top:4px;" id="banner-sub">Hermes history, skills, and state are being restored. Gateway will start automatically once ready.</div>
   </div>
 </div>
 """
@@ -161,133 +144,135 @@ STARTUP_BANNER = """
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hermes Agent Live Stats (Koyeb Free Tier)</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-        body { background-color: #0f172a; color: #f8fafc; padding: 20px; min-height: 100vh; }
-        .container { max-width: 900px; margin: 0 auto; }
-        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; border-bottom: 1px solid #1e293b; padding-bottom: 16px; }
-        h1 { font-size: 24px; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
-        .status-badge { background-color: #065f46; color: #34d399; padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
-        .status-dot { width: 8px; height: 8px; background-color: #34d399; border-radius: 50%; animation: pulse 2s infinite; }
-        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 24px; }
-        .card { background-color: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
-        .card h2 { font-size: 14px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; display: flex; justify-content: space-between; }
-        .value { font-size: 26px; font-weight: 700; color: #f8fafc; margin-bottom: 8px; }
-        .subtext { font-size: 13px; color: #64748b; }
-        .progress-bar { width: 100%; height: 8px; background-color: #334155; border-radius: 4px; overflow: hidden; margin-top: 12px; }
-        .progress-fill { height: 100%; background-color: #38bdf8; transition: width 0.5s ease; border-radius: 4px; }
-        .table-card { background-color: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
-        .table-card h2 { font-size: 16px; color: #f8fafc; margin-bottom: 16px; }
-        table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }
-        th, td { padding: 10px 12px; border-bottom: 1px solid #334155; }
-        th { color: #94a3b8; font-weight: 600; font-size: 12px; text-transform: uppercase; }
-        td { color: #e2e8f0; }
-        tr:last-child td { border-bottom: none; }
-        footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 12px; }
-        #startup-banner { transition: opacity 0.5s; }
-        #startup-banner.hidden { opacity: 0; pointer-events: none; }
-        .dash-link { display: inline-block; margin-top: 10px; color: #38bdf8; font-size: 13px; text-decoration: none; }
-        .dash-link:hover { text-decoration: underline; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hermes Live Stats</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+body { background-color: #0f172a; color: #f8fafc; padding: 20px; min-height: 100vh; }
+.container { max-width: 900px; margin: 0 auto; }
+header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 24px; border-bottom: 1px solid #1e293b; padding-bottom: 16px; }
+h1 { font-size: 24px; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
+.status-badge { background-color: #065f46; color: #34d399; padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
+.status-dot { width: 8px; height: 8px; background-color: #34d399; border-radius: 50%; animation: pulse 2s infinite; }
+@keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.card { background-color: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
+.card h2 { font-size: 14px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; display: flex; justify-content: space-between; }
+.value { font-size: 24px; font-weight: 700; color: #f8fafc; margin-bottom: 8px; }
+.subtext { font-size: 13px; color: #64748b; line-height: 1.6; }
+.progress-bar { width: 100%; height: 8px; background-color: #334155; border-radius: 4px; overflow: hidden; margin-top: 12px; }
+.progress-fill { height: 100%; background-color: #38bdf8; transition: width 0.5s ease; border-radius: 4px; }
+.table-card { background-color: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; overflow-x: auto; }
+.table-card h2 { font-size: 16px; color: #f8fafc; margin-bottom: 16px; }
+table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }
+th, td { padding: 10px 12px; border-bottom: 1px solid #334155; }
+th { color: #94a3b8; font-weight: 600; font-size: 12px; text-transform: uppercase; }
+td { color: #e2e8f0; }
+tr:last-child td { border-bottom: none; }
+footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 12px; line-height: 1.6; }
+#startup-banner { transition: opacity 0.5s; }
+#startup-banner.hidden { opacity: 0; pointer-events: none; display: none !important; }
+.dash-link { display: inline-block; margin-top: 10px; color: #38bdf8; font-size: 13px; text-decoration: none; }
+.dash-link:hover { text-decoration: underline; }
+.warn { color: #f43f5e; font-weight: 700; }
+</style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>⚡ Hermes Agent Live Stats</h1>
-            <div class="status-badge"><span class="status-dot"></span> 0.1 vCPU / 512 MB RAM / 2000 MB Disk</div>
-        </header>
+<div class="container">
+  <header>
+    <h1>⚡ Hermes Live Stats <span id="platform" style="font-size:14px;color:#94a3b8"></span></h1>
+    <div class="status-badge"><span class="status-dot"></span> <span id="limits">...</span></div>
+  </header>
 
-        """ + STARTUP_BANNER + """
+""" + STARTUP_BANNER + """
 
-        <div class="grid">
-            <div class="card">
-                <h2>RAM Usage (512 MB) <span id="mem-pct">0%</span></h2>
-                <div class="value" id="mem-val">0 MB / 512 MB</div>
-                <div class="subtext" id="mem-free">Free: 512 MB</div>
-                <div class="progress-bar"><div class="progress-fill" id="mem-bar" style="width: 0%;"></div></div>
-            </div>
-            <div class="card">
-                <h2>Disk Storage (2000 MB) <span id="disk-pct">0%</span></h2>
-                <div class="value" id="disk-val">0 MB / 2000 MB</div>
-                <div class="subtext" id="disk-free">Free: 2000 MB</div>
-                <div class="progress-bar"><div class="progress-fill" id="disk-bar" style="width: 0%; background-color: #34d399;"></div></div>
-            </div>
-            <div class="card">
-                <h2>vCPU Load (0.1 vCPU) <span id="cpu-pct">0%</span></h2>
-                <div class="value" id="cpu-val">0%</div>
-                <div class="subtext" id="load-avg">Load Avg: 0.00, 0.00, 0.00</div>
-                <div class="progress-bar"><div class="progress-fill" id="cpu-bar" style="width: 0%; background-color: #f43f5e;"></div></div>
-            </div>
-        </div>
-        <div class="table-card">
-            <h2>System Info & Top Processes</h2>
-            <div style="margin-bottom: 16px; font-size: 14px; color: #94a3b8;">
-                System Uptime: <strong id="uptime" style="color: #f8fafc;">...</strong>
-            </div>
-            <table>
-                <thead><tr><th>PID</th><th>Command</th><th>RAM %</th><th>CPU %</th></tr></thead>
-                <tbody id="proc-table">
-                    <tr><td colspan="4" style="text-align: center; color: #64748b;">Loading...</td></tr>
-                </tbody>
-            </table>
-            <a class="dash-link" href="/dashboard" target="_blank">Open Hermes Dashboard →</a>
-        </div>
-        <footer>Auto-refreshing every 2 seconds • Koyeb Free Tier Monitoring</footer>
+  <div class="grid">
+    <div class="card">
+      <h2>RAM <span id="mem-pct">0%</span></h2>
+      <div class="value" id="mem-val">...</div>
+      <div class="subtext" id="mem-sub"></div>
+      <div class="progress-bar"><div class="progress-fill" id="mem-bar" style="width:0%"></div></div>
     </div>
-    <script>
-        function updateStats() {
-            fetch('/api/stats')
-                .then(res => res.json())
-                .then(data => {
-                    document.getElementById('mem-val').innerText = data.memory.used_mb + ' MB / 512 MB';
-                    document.getElementById('mem-pct').innerText = data.memory.percent + '%';
-                    document.getElementById('mem-free').innerText = 'Free: ' + data.memory.free_mb + ' MB';
-                    document.getElementById('mem-bar').style.width = data.memory.percent + '%';
-                    document.getElementById('disk-val').innerText = data.disk.used_mb + ' MB / 2000 MB';
-                    document.getElementById('disk-pct').innerText = data.disk.percent + '%';
-                    document.getElementById('disk-free').innerText = 'Free: ' + data.disk.free_mb + ' MB';
-                    document.getElementById('disk-bar').style.width = data.disk.percent + '%';
-                    document.getElementById('cpu-val').innerText = data.cpu.percent + '%';
-                    document.getElementById('cpu-pct').innerText = data.cpu.percent + '%';
-                    document.getElementById('load-avg').innerText = 'Load Avg: ' + data.cpu.load_avg.join(', ');
-                    document.getElementById('cpu-bar').style.width = data.cpu.percent + '%';
-                    document.getElementById('uptime').innerText = data.uptime;
-
-                    // Startup banner update
-                    if (data.startup && data.startup.phase === 'ready') {
-                        var banner = document.getElementById('startup-banner');
-                        if (banner) banner.classList.add('hidden');
-                    } else if (data.startup) {
-                        var title = document.getElementById('banner-title');
-                        if (title) title.innerText = data.startup.message || 'Restoring...';
-                    }
-
-                    var tbody = document.getElementById('proc-table');
-                    tbody.innerHTML = '';
-                    data.processes.forEach(function(p) {
-                        var tr = document.createElement('tr');
-                        tr.innerHTML = '<td>' + p.pid + '</td><td>' + p.command + '</td><td>' + p.mem + '%</td><td>' + p.cpu + '%</td>';
-                        tbody.appendChild(tr);
-                    });
-                })
-                .catch(function(err) { console.error('Stats fetch error:', err); });
-        }
-        setInterval(updateStats, 2000);
-        updateStats();
-    </script>
+    <div class="card">
+      <h2>Disk <span id="disk-pct">0%</span></h2>
+      <div class="value" id="disk-val">...</div>
+      <div class="subtext" id="disk-sub"></div>
+      <div class="progress-bar"><div class="progress-fill" id="disk-bar" style="width:0%;background-color:#34d399"></div></div>
+    </div>
+    <div class="card">
+      <h2>CPU <span id="cpu-pct">0%</span></h2>
+      <div class="value" id="cpu-val">...</div>
+      <div class="subtext" id="cpu-sub"></div>
+      <div class="progress-bar"><div class="progress-fill" id="cpu-bar" style="width:0%;background-color:#f43f5e"></div></div>
+    </div>
+  </div>
+  <div class="table-card">
+    <h2>Container uptime &amp; top processes</h2>
+    <div style="margin-bottom:16px;font-size:14px;color:#94a3b8;">Container uptime: <strong id="uptime" style="color:#f8fafc;">...</strong></div>
+    <table>
+      <thead><tr><th>PID</th><th>Command</th><th>RAM (MB)</th><th>RAM %</th><th>CPU % of limit</th></tr></thead>
+      <tbody id="proc-table"><tr><td colspan="5" style="text-align:center;color:#64748b;">Loading...</td></tr></tbody>
+    </table>
+    <a class="dash-link" href="/picoclaw" target="_blank">Open PicoClaw →</a>
+  </div>
+  <footer id="foot">Auto-refreshing every 3 seconds</footer>
+</div>
+<script>
+function $(id){return document.getElementById(id);}
+function updateStats() {
+  fetch('/api/stats').then(function(r){return r.json();}).then(function(d) {
+    var m=d.memory, k=d.disk, c=d.cpu;
+    $('platform').textContent = '(' + d.platform + ')';
+    $('limits').textContent = c.limit_cores + ' vCPU / ' + m.total_mb + ' MB RAM / ' + k.total_mb + ' MB disk';
+    $('mem-val').textContent = m.used_mb + ' MB / ' + m.total_mb + ' MB';
+    $('mem-pct').textContent = m.percent + '%';
+    $('mem-bar').style.width = m.percent + '%';
+    var ms = 'Free: ' + m.free_mb + ' MB • page cache (not counted): ' + m.cache_mb + ' MB';
+    if (m.peak_mb) ms += ' • peak: ' + m.peak_mb + ' MB';
+    $('mem-sub').textContent = ms;
+    if (m.oom_kills) { var w=document.createElement('div'); w.className='warn'; w.textContent='⚠ OOM kills so far: ' + m.oom_kills + ' (a process was killed for using too much RAM)'; $('mem-sub').appendChild(w); }
+    $('disk-val').textContent = k.used_mb + ' MB / ' + k.total_mb + ' MB';
+    $('disk-pct').textContent = k.percent + '%';
+    $('disk-bar').style.width = k.percent + '%';
+    var parts = Object.keys(k.parts || {}).map(function(p){return p + ' ' + k.parts[p] + ' MB';}).join(' • ');
+    $('disk-sub').textContent = 'Free: ' + k.free_mb + ' MB' + (parts ? ' • ' + parts : '');
+    $('cpu-val').textContent = c.percent + '% of ' + c.limit_cores + ' vCPU';
+    $('cpu-pct').textContent = c.percent + '%';
+    $('cpu-bar').style.width = c.percent + '%';
+    $('cpu-sub').textContent = 'Using ' + c.cores_used + ' vCPU • avg 1m/5m/15m: ' + c.avg['1m'] + '% / ' + c.avg['5m'] + '% / ' + c.avg['15m'] + '% • throttled: ' + c.throttled_percent + '%';
+    $('uptime').textContent = d.uptime;
+    $('foot').textContent = 'Auto-refreshing every 3 seconds • RAM/CPU from ' + m.source + ' (limits: ' + m.limit_source + '; ' + c.limit_source + ') • disk limit: ' + k.limit_source;
+    if (d.startup && d.startup.phase === 'ready') { $('startup-banner').classList.add('hidden'); }
+    else if (d.startup) { $('banner-title').textContent = d.startup.message || 'Restoring...'; }
+    var tbody = $('proc-table'); tbody.innerHTML = '';
+    d.processes.forEach(function(p) {
+      var tr = document.createElement('tr');
+      [p.pid, p.command, p.rss_mb, p.mem + '%', p.cpu + '%'].forEach(function(v){ var td=document.createElement('td'); td.textContent=v; tr.appendChild(td); });
+      tbody.appendChild(tr);
+    });
+  }).catch(function(err) { console.error('Stats fetch error:', err); });
+}
+setInterval(updateStats, 3000);
+updateStats();
+</script>
 </body>
 </html>
 """
 
-SILENT_ROUTES = {'/', '/api/stats'}
+SILENT_ROUTES = {'/', '/api/stats', '/picoclaw/status.json'}
 
 
-def _is_dashboard_path(path):
-    return path == DASHBOARD_PREFIX or path.startswith(DASHBOARD_PREFIX + "/") or path.startswith(DASHBOARD_PREFIX + "?")
+def _is_picoclaw_path(path):
+    return path == PICOCLAW_PREFIX or path.startswith((PICOCLAW_PREFIX + "/", PICOCLAW_PREFIX + "?"))
+
+
+_ABS_LINK_RE = re.compile(r'''(\s(?:src|href|action)=["'])/(?!/|picoclaw/)''', re.I)
+
+
+def rewrite_html_links(html):
+    """Best effort: make root-absolute links of the proxied UI work under /picoclaw/ (JS-built URLs are not touched)."""
+    return _ABS_LINK_RE.sub(lambda m: m.group(1) + PICOCLAW_PREFIX + "/", html)
 
 
 class PingHandler(http.server.BaseHTTPRequestHandler):
@@ -298,113 +283,143 @@ class PingHandler(http.server.BaseHTTPRequestHandler):
                 return
         super().log_message(format, *args)
 
-    # ── Reverse proxy to the loopback-only Hermes dashboard ──
-    def _proxy_to_dashboard(self, method):
-        upstream_path = self.path[len(DASHBOARD_PREFIX):] or "/"
-        if not upstream_path.startswith("/"):
-            upstream_path = "/" + upstream_path
-        url = f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}{upstream_path}"
+    # ── helpers ──
+    def _send(self, code, ctype, body, extra=None):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
+    def _authorized(self):
+        if not UI_BASIC_AUTH:
+            return True
+        hdr = self.headers.get("Authorization", "")
+        if hdr.lower().startswith("basic "):
+            try:
+                if base64.b64decode(hdr[6:]).decode("utf-8") == UI_BASIC_AUTH:
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+        self._send(401, "text/plain", "Authentication required", {"WWW-Authenticate": 'Basic realm="PicoClaw"'})
+        return False
+
+    # ── /picoclaw ──
+    def _picoclaw(self, method):
+        if not self._authorized():
+            return
+        path = self.path.split("?", 1)[0]
+        query = self.path[len(path):]
+        if path == PICOCLAW_PREFIX + "/status.json":
+            self._send(200, "application/json", json.dumps(picoclaw_status()))
+            return
+        ui_up = port_open(PICOCLAW_UI_PORT)
+        if not ui_up:
+            if path in (PICOCLAW_PREFIX, PICOCLAW_PREFIX + "/") and method in ("GET", "HEAD"):
+                self._send(200, "text/html; charset=utf-8", STATUS_PAGE)
+            else:
+                self._send(503, "text/plain", f"PicoClaw web UI is not running on port {PICOCLAW_UI_PORT}")
+            return
+        if "websocket" in (self.headers.get("Upgrade", "") or "").lower():
+            self._send(501, "text/plain", "WebSocket is not supported through this route; open the UI via Tailscale "
+                                          f"(http://<hostname>:{PICOCLAW_UI_PORT}/).")
+            return
+        upstream_path = path[len(PICOCLAW_PREFIX):] or "/"
+        url = f"http://{PICOCLAW_HOST}:{PICOCLAW_UI_PORT}{upstream_path}{query}"
         body = None
         length = self.headers.get("Content-Length")
         if length:
             try:
                 body = self.rfile.read(int(length))
-            except Exception:
+            except Exception:  # noqa: BLE001
                 body = None
-
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
-
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                self.send_response(resp.status)
-                for k, v in resp.getheaders():
-                    if k.lower() not in HOP_BY_HOP_HEADERS:
-                        self.send_header(k, v)
-                self.end_headers()
-                self.wfile.write(resp.read())
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                self._relay(resp.status, resp.getheaders(), resp.read())
         except urllib.error.HTTPError as e:
-            self.send_response(e.code)
+            data = b""
             try:
-                for k, v in (e.headers.items() if e.headers else []):
-                    if k.lower() not in HOP_BY_HOP_HEADERS:
-                        self.send_header(k, v)
-            except Exception:
+                data = e.read()
+            except Exception:  # noqa: BLE001
                 pass
-            self.end_headers()
-            try:
-                self.wfile.write(e.read())
-            except Exception:
-                pass
-        except Exception as e:
-            self.send_response(502)
-            self.send_header("Content-type", "text/plain")
-            self.end_headers()
-            self.wfile.write(f"Dashboard proxy error: {e}".encode())
+            self._relay(e.code, list(e.headers.items()) if e.headers else [], data)
+        except Exception as e:  # noqa: BLE001
+            self._send(502, "text/plain", f"PicoClaw UI proxy error: {e}")
 
+    def _relay(self, status, headers, data):
+        ctype = ""
+        out = []
+        for k, v in headers:
+            if k.lower() in HOP_BY_HOP_HEADERS:
+                continue
+            if k.lower() == "content-type":
+                ctype = v
+            out.append((k, v))
+        if "text/html" in ctype.lower():
+            data = rewrite_html_links(data.decode("utf-8", "replace")).encode("utf-8")
+        self.send_response(status)
+        for k, v in out:
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    # ── routes ──
     def do_GET(self):
-        if _is_dashboard_path(self.path):
-            self._proxy_to_dashboard("GET")
+        if _is_picoclaw_path(self.path):
+            self._picoclaw("GET")
         elif self.path == '/memory':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            self.wfile.write(HTML_PAGE.encode('utf-8'))
+            self._send(200, 'text/html; charset=utf-8', HTML_PAGE)
         elif self.path == '/api/stats':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(get_stats()).encode('utf-8'))
+            self._send(200, 'application/json', json.dumps(get_stats()))
         elif self.path == '/startup-ready':
             # start.sh हा endpoint call करतो जेव्हा restore पूर्ण होतो
             set_startup_ready()
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b"OK")
+            self._send(200, 'text/plain', b"OK")
         else:
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
+            self._send(200, 'text/html', b"Hermes Agent is Alive and Running!")
+
+    def _write_method(self, method):
+        if _is_picoclaw_path(self.path):
+            self._picoclaw(method)
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
-            self.wfile.write(b"Hermes Agent is Alive and Running!")
 
     def do_POST(self):
-        if _is_dashboard_path(self.path):
-            self._proxy_to_dashboard("POST")
-        else:
-            self.send_response(404)
-            self.end_headers()
+        self._write_method("POST")
 
     def do_PUT(self):
-        if _is_dashboard_path(self.path):
-            self._proxy_to_dashboard("PUT")
-        else:
-            self.send_response(404)
-            self.end_headers()
+        self._write_method("PUT")
 
     def do_DELETE(self):
-        if _is_dashboard_path(self.path):
-            self._proxy_to_dashboard("DELETE")
-        else:
-            self.send_response(404)
-            self.end_headers()
+        self._write_method("DELETE")
 
     def do_PATCH(self):
-        if _is_dashboard_path(self.path):
-            self._proxy_to_dashboard("PATCH")
-        else:
-            self.send_response(404)
-            self.end_headers()
+        self._write_method("PATCH")
 
     def do_HEAD(self):
-        if _is_dashboard_path(self.path):
-            self._proxy_to_dashboard("HEAD")
+        if _is_picoclaw_path(self.path):
+            self._picoclaw("HEAD")
         else:
             self.send_response(200)
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
-port = int(os.environ.get("PORT", 10000))
-httpd = http.server.HTTPServer(('0.0.0.0', port), PingHandler)
-print(f"Ping server running on port {port} with /memory stats page and /dashboard proxy...")
-httpd.serve_forever()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    # Threaded: a slow request (UI proxy, many pollers) must never block the platform's health check on "/".
+    http.server.ThreadingHTTPServer.daemon_threads = True
+    httpd = http.server.ThreadingHTTPServer(('0.0.0.0', port), PingHandler)
+    print(f"Ping server running on port {port} with /memory stats page and /picoclaw route...")
+    httpd.serve_forever()
