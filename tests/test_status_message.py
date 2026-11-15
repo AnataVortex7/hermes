@@ -97,5 +97,41 @@ class StatusMessageTests(unittest.TestCase):
         _sleep(0.5)
 
 
+class DescribeTests(unittest.TestCase):
+    def test_commands_become_short_phrases(self):
+        d = m.describe_command
+        self.assertEqual(d("cd /root/work && pip install --no-cache-dir pandas openpyxl"), "installing pandas, openpyxl")
+        self.assertEqual(d("cd x && python3 -u scrape.py --all 2>&1 | tail -20"), "running scrape.py")
+        self.assertEqual(d("curl -s -H 'Authorization: Bearer abc123' https://api.example.com/v1/x?key=1"), "downloading api.example.com")
+        self.assertEqual(d("python3 -m pytest tests -q"), "running tests")
+        self.assertEqual(d("sleep 30"), "waiting 30s")
+        self.assertEqual(d("grep -rn 'TODO' ."), "searching TODO")
+
+    def test_tools_and_secrets(self):
+        self.assertEqual(m.describe_tool("write_file", {"path": "/root/.picoclaw/workspace/scripts/app.py", "content": "x"}), "writing app.py")
+        self.assertEqual(m.describe_tool("mcp__s__web_fetch", {"url": "https://docs.example.com/a/b?token=zzz"}), "opening docs.example.com")
+        self.assertEqual(m.describe_tool("web_search", {"query": "koyeb ram limit"}), "searching “koyeb ram limit”")
+        out = m.describe_command("export K=1 && mytool --password hunter2 AKIAABCDEFGHIJKLMNOPQRSTUVWXYZ123456")
+        self.assertNotIn("hunter2", out)
+        self.assertNotIn("AKIAABCDEFGHIJKLMNOPQRSTUVWXYZ123456", out)
+        self.assertEqual(m.describe_tool("weird", None), "")
+
+    def test_why_is_first_sentence_only(self):
+        self.assertEqual(m.describe_why("Now I install pandas to parse the CSV. Then I will plot it."), "Now I install pandas to parse the CSV.")
+        self.assertEqual(m.describe_why(""), "")
+        self.assertEqual(m.describe_why("[hermes-guard] nudge text here"), "")
+
+
+class StatusDetailTests(unittest.TestCase):
+    def test_render_shows_what_and_why(self):
+        t = m._Turn()
+        t.phase, t.names, t.details, t.why, t.steps = "tool", ["exec"], ["installing pandas"], "CSV parse karayla", 27
+        t.started = time.time() - 8 * 60
+        text = m.StatusMessage.render(t)
+        self.assertEqual(text, "⚙️ Agent is working…\n🔧 exec — installing pandas\n💡 CSV parse karayla\nStep 27 · 8m")
+        t.phase, t.last_tools = "thinking", m.StatusMessage._labels(t)
+        self.assertIn("🧠 Thinking… (last: exec — installing pandas)", m.StatusMessage.render(t))
+
+
 if __name__ == "__main__":
     unittest.main()

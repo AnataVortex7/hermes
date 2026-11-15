@@ -28,10 +28,22 @@ The Dockerfile installs a fixed release (`ARG PICOCLAW_VERSION=v0.3.1`) from
 (`cat /etc/picoclaw-version`). `latest` is rejected on purpose. To upgrade, change that one line and redeploy.
 
 ## Live "Agent is working" status (Telegram)
-While a job runs, the proxy keeps ONE message updated: `⚙️ Agent is working… / 🔧 exec / Step 12 · 14m`.
-It shows the short name of the tool the model just called (`🧠 Thinking… (last: exec)` while it waits for the LLM),
-the step count and elapsed time (minutes change every minute, so a 3-hour job visibly stays alive).
-When the job ends the message is deleted; if there is no activity for `TYPING_MAX_IDLE` (12 min) it becomes a warning and stays.
+While a job runs, the proxy keeps ONE message updated, with **what exactly** the tool is doing and **why**:
+
+```
+⚙️ Agent is working…
+🔧 exec — installing pandas, openpyxl
+💡 Now I install the libraries to parse the CSV.
+Step 27 · 8m
+```
+- `🔧 tool — what`: built from the tool call's name + arguments by plain parsing (no extra LLM request, no API, no tokens):
+  `exec` commands become `running scrape.py`, `installing ...`, `downloading host`, `running tests`, `waiting 30s`, `searching ...`;
+  file tools become `reading/writing/editing <file>`; `web_search` shows the query, `web_fetch` the host.
+- `💡 why`: the first sentence the model already wrote next to its tool call (free); omitted when it wrote none.
+- Secrets are masked (tokens, passwords, `Bearer ...`, long keys, `user:pass@`), URLs show only the host.
+- While it waits for the LLM: `🧠 Thinking… (last: exec — installing pandas)`; the step count and elapsed time stay (minutes change every
+  minute, so a 3-hour job visibly stays alive). When the job ends the message is deleted; if there is no activity for
+  `TYPING_MAX_IDLE` (12 min) it becomes a warning and stays.
 
 | Variable | Default | Notes |
 |---|---|---|

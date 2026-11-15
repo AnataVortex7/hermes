@@ -991,6 +991,134 @@ def short_tool_name(name, limit=24):
     return name if len(name) <= limit else name[:limit - 1] + "…"
 
 
+# --------------------------------------------------------------------------- what is the agent doing? (status text)
+# Built ONLY from the tool call the model already emitted (name + arguments) and the sentence it wrote next to it:
+# no extra LLM request, no API, no tokens. Secrets are masked, everything is cut to one short line.
+_SECRET_RE = re.compile(r"(?i)((?:bearer|token|api[_-]?key|apikey|secret|passw(?:or)?d|pwd|authorization|auth)[\"'\s:=]+)\S+")
+_LONG_RE = re.compile(r"[A-Za-z0-9_\-+=]{28,}")
+_NOISE_CMDS = {"cd", "export", "set", "source", ".", "echo", "mkdir", "true", "clear", "unset", "umask", "pwd", "ulimit"}
+_PREFIX_CMDS = {"sudo", "nohup", "time", "env", "stdbuf", "nice", "setsid"}
+_CMD_SPLIT = re.compile(r"\s*(?:&&|\|\||;|\n)\s*")
+
+
+def _clip(text, limit):
+    text = re.sub(r"\s+", " ", text or "").strip()
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _redact(text):
+    text = re.sub(r"://[^/\s:@]+:[^/\s@]+@", "://", text or "")
+    text = _SECRET_RE.sub(lambda m: m.group(1) + "***", text)
+    return _LONG_RE.sub("***", text)
+
+
+def _host(url):
+    m = re.match(r"(?:\w+://)?(?:[^/@\s]*@)?([^/?#\s:]+)", (url or "").strip())
+    return m.group(1) if m else _clip(url, 30)
+
+
+def _pkgs(rest):
+    names = [w for w in rest.split() if not w.startswith("-") and not w.startswith(("&", "|", ">", "2>"))]
+    return _clip(", ".join(names[:4]) + (" …" if len(names) > 4 else ""), 40) or "packages"
+
+
+def describe_command(cmd):
+    """Short human phrase for a shell command: `cd x && pip install pandas` -> `installing pandas`."""
+    segs = []
+    for seg in _CMD_SPLIT.split(cmd or ""):
+        words = seg.split()
+        while words and (re.match(r"^\w+=\S*$", words[0]) or words[0] in _PREFIX_CMDS):
+            words = words[1:]
+        if words and words[0] == "timeout" and len(words) > 2:
+            words = words[2:]
+        if words and words[0] not in _NOISE_CMDS:
+            segs.append(words)
+    if not segs:
+        return _clip(_redact(cmd), 50) or "shell"
+    w = segs[-1]                                              # the last real step is what runs now
+    line = " ".join(w)
+    head = os.path.basename(w[0])
+    if re.match(r"^(pip3?|python3?|uv)$", head) and re.search(r"\b(?:pip )?install\b", line):
+        return "installing " + _pkgs(re.split(r"\binstall\b", line, 1)[1])
+    if head in ("npm", "yarn", "pnpm") and len(w) > 1 and w[1] in ("install", "i", "add"):
+        return "installing " + _pkgs(" ".join(w[2:]))
+    if head in ("apt", "apt-get") and "install" in w:
+        return "installing " + _pkgs(line.split("install", 1)[1])
+    if re.match(r"^python[\d.]*$", head) or head in ("node", "ruby", "php", "perl", "bash", "sh"):
+        script = next((a for a in w[1:] if not a.startswith("-")), "")
+        if "pytest" in line or "unittest" in line:
+            return "running tests"
+        return "running " + _clip(os.path.basename(script) or "inline code", 30)
+    if head in ("pytest", "tox"):
+        return "running tests"
+    if head in ("curl", "wget"):
+        url = next((a for a in w[1:] if re.match(r"^\w+://", a)), "")
+        return "downloading " + _host(url) if url else head
+    if head == "git" and len(w) > 1:
+        tail = _host(w[2]) if w[1] == "clone" and len(w) > 2 else ""
+        return _clip(("git " + w[1] + (" " + os.path.basename(w[2].rstrip("/")) if tail else "")), 40)
+    if head in ("cat", "head", "tail", "less", "sed", "awk", "wc", "stat", "file"):
+        f = next((a for a in reversed(w[1:]) if not a.startswith("-")), "")
+        return "reading " + _clip(os.path.basename(f) or "file", 30)
+    if head in ("ls", "find", "tree", "du"):
+        return "listing files"
+    if head in ("grep", "rg", "egrep"):
+        pat = next((a for a in w[1:] if not a.startswith("-")), "")
+        return "searching " + _clip(_redact(pat.strip("\"'")), 24)
+    if head == "sleep" and len(w) > 1:
+        return f"waiting {w[1]}s"
+    if head in ("rm", "mv", "cp", "chmod", "touch"):
+        return _clip(head + " " + os.path.basename(w[-1]) if len(w) > 1 else head, 40)
+    if head in ("hdash", "ramguard", "tsports"):
+        return _clip(_redact(line), 40)
+    return _clip(_redact(line), 50)
+
+
+def describe_tool(name, args):
+    """One short line (no icon) about what a tool call does. Never raises."""
+    try:
+        n = (name or "").split("__")[-1].lower()
+        a = args if isinstance(args, dict) else {}
+        s = lambda *keys: next((str(a[k]) for k in keys if isinstance(a.get(k), (str, int)) and str(a[k]).strip()), "")  # noqa: E731
+        path = s("path", "file_path", "filepath", "filename", "file", "dir")
+        if n in ("exec", "bash", "shell", "run", "run_command", "execute"):
+            return describe_command(s("command", "cmd", "script"))
+        if n in ("read_file", "read", "view", "cat"):
+            return "reading " + _clip(os.path.basename(path) or path, 36)
+        if n in ("write_file", "create_file", "write"):
+            return "writing " + _clip(os.path.basename(path) or path, 36)
+        if n in ("edit_file", "append_file", "str_replace", "edit"):
+            return "editing " + _clip(os.path.basename(path) or path, 36)
+        if n in ("list_dir", "ls", "list_files"):
+            return "listing " + _clip(path or "files", 36)
+        if n in ("web_search", "search"):
+            return "searching “" + _clip(_redact(s("query", "q")), 40) + "”"
+        if n in ("web_fetch", "fetch", "browse", "open_url", "navigate"):
+            return "opening " + _host(s("url", "link"))
+        if n == "message":
+            return "sending a message"
+        if n == "send_file":
+            return "sending " + _clip(os.path.basename(path) or "a file", 30)
+        if n == "cron":
+            return "cron " + _clip(s("action", "op", "name"), 20)
+        if n in ("spawn", "subagent", "task"):
+            return "sub-agent: " + _clip(_redact(s("task", "prompt", "description")), 40)
+        return _clip(_redact(s("description", "command", "query", "url", "path", "task", "name", "text")), 50)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def describe_why(content):
+    """The sentence the model wrote next to its tool call ('Now I will ... because ...'), cut short. Free: already in the reply."""
+    if isinstance(content, list):
+        content = " ".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+    text = re.sub(r"\s+", " ", str(content or "")).strip()
+    if len(text) < 8 or text.startswith("[hermes"):
+        return ""
+    first = re.split(r"(?<=[.!?:।])\s", text, 1)[0]
+    return _clip(_redact(first), 90)
+
+
 class _Turn:
     def __init__(self):
         self.started = time.time()
@@ -998,6 +1126,8 @@ class _Turn:
         self.phase = "thinking"       # thinking = waiting for the LLM, tool = tools are running
         self.names = []
         self.last_tools = []
+        self.details = []             # one short 'what exactly' phrase per tool in names
+        self.why = ""                 # the model's own one-line reason (free, from its reply)
         self.finish_at = 0.0          # explicit finish (final answer); cancelled by a new request within the linger
         self.stalled = False
         self.done = threading.Event()
@@ -1035,7 +1165,7 @@ class StatusMessage:
             t = self._turn = _Turn()
         threading.Thread(target=self._run, args=(t,), daemon=True).start()
 
-    def tools(self, names):
+    def tools(self, names, details=None, why=""):
         with self._lock:
             t = self._turn
             if t is None or t.done.is_set():
@@ -1043,8 +1173,15 @@ class StatusMessage:
             t.finish_at = 0.0
             t.phase = "tool"
             t.names = [short_tool_name(n) for n in names][:3]
-            t.last_tools = t.names
+            t.details = [_clip(d, 60) for d in (details or [])][:3]
+            t.why = why or ""
+            t.last_tools = self._labels(t)
             t.steps += max(len(names), 1)
+
+    @staticmethod
+    def _labels(t):
+        """`exec — installing pandas` per tool (just `exec` when no detail is known)."""
+        return [n + (" — " + t.details[i] if i < len(t.details) and t.details[i] else "") for i, n in enumerate(t.names)]
 
     def finish(self):
         with self._lock:
@@ -1056,10 +1193,13 @@ class StatusMessage:
     @staticmethod
     def render(t, now=None):
         mins = int(((now or time.time()) - t.started) // 60)
+        labels = StatusMessage._labels(t)
         if t.phase == "tool" and t.names:
-            line = "🔧 " + " + ".join(t.names)
+            line = "🔧 " + "\n🔧 ".join(labels)
+            if t.why:
+                line += "\n💡 " + t.why
         elif t.last_tools:
-            line = "🧠 Thinking… (last: " + " + ".join(t.last_tools) + ")"
+            line = "🧠 Thinking… (last: " + " + ".join(t.last_tools[:2]) + ")"
         else:
             line = "🧠 Thinking…"
         h, m = divmod(mins, 60)
@@ -1400,7 +1540,9 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
                         # quick ones (read/write file ...) a short one, so a dead turn never types for 12 min.
                         TYPING.touch(idle=None if names & _SLOW_TOOLS else QUICK_TOOL_IDLE)
                         if STATUS is not None:
-                            STATUS.tools([(x.get("function") or {}).get("name") or "?" for x in calls])
+                            STATUS.tools([(x.get("function") or {}).get("name") or "?" for x in calls],
+                                         [describe_tool((x.get("function") or {}).get("name"), _tool_args(x)) for x in calls],
+                                         describe_why((ch0.get("message") or {}).get("content")))
                     else:
                         TYPING.finish()     # final answer, or send_file (PicoClaw ends the turn after it)
                         if STATUS is not None:
