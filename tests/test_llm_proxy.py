@@ -134,6 +134,8 @@ class ProxyTests(unittest.TestCase):
             LLM_FIRST_BYTE_TIMEOUT="0.6",
             LLM_STREAM_IDLE_TIMEOUT="0.6",
             LLM_TIMEOUT_RETRIES="1",
+            LLM_HTTP_RETRIES="3",
+            LLM_NOTIFY_ERRORS="0",
             HERMES_WORKSPACE="/ws",
         )
         import llm_proxy
@@ -231,10 +233,10 @@ class ProxyTests(unittest.TestCase):
         self.assertTrue(json.loads(raw)["choices"][0]["message"].get("tool_calls"))
         self.assertEqual(len(SEEN), 2)
 
-    def test_stalled_only_retried_once(self):
-        SCRIPT.extend([sse(*text_chunks("Let me check:")), sse(*text_chunks("Let me check again:"))])
+    def test_stalled_is_retried_up_to_the_retry_limit_then_passed_on(self):
+        SCRIPT.extend([sse(*text_chunks("Let me check:")), sse(*text_chunks("Let me check again:")), sse(*text_chunks("Still checking:"))])
         _, raw = self.call(self.msg())
-        self.assertEqual(len(SEEN), 2)   # one retry, then the reply is passed on as is
+        self.assertEqual(len(SEEN), 3)   # original + 2 re-asks (LLM_GUARD_MAX_RETRIES), then passed on as is
 
     def test_real_final_answer_not_retried(self):
         SCRIPT.append(sse(*text_chunks("Cron job created and tested ✅. Let me know if you want changes.")))
@@ -406,18 +408,18 @@ class ProxyTests(unittest.TestCase):
             self.assertTrue(fv(self._tc(name, **a)), (name, a))
         for name, a in [("write_file", {"path": "/root/.picoclaw/workspace/dashboards/a/index.html"}),
                         ("exec", {"command": "cat /app/start.sh | head"}), ("exec", {"command": "tailscale status"}),
-                        ("exec", {"command": "dash start live /root/.picoclaw/workspace/dashboards/live"}),
+                        ("exec", {"command": "hdash start live /root/.picoclaw/workspace/dashboards/live"}),
                         ("exec", {"command": "python3 /app/notify.py hi"}), ("exec", {"command": "pip install requests"}),
                         ("write_file", {"path": "/root/.picoclaw/workspace/app/x.py"})]:
             self.assertIsNone(fv(self._tc(name, **a)), (name, a))
 
     def test_blocked_tool_call_is_bounced_back_and_model_corrects_itself(self):
         SCRIPT.extend([sse(*tool_chunks([(0, "c1", "write_file", '{"path":"/app/start.sh","content":"x"}')])),
-                       sse(*tool_chunks([(0, "c2", "exec", '{"command":"dash start live /root/.picoclaw/workspace/dashboards/live"}')]))])
+                       sse(*tool_chunks([(0, "c2", "exec", '{"command":"hdash start live /root/.picoclaw/workspace/dashboards/live"}')]))])
         _, raw = self.call(self.msg())
         self.assertEqual(len(SEEN), 2)
         self.assertIn("BLOCKED", SEEN[1]["messages"][-1]["content"])
-        self.assertIn("dash start", json.loads(raw)["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])
+        self.assertIn("hdash start", json.loads(raw)["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"])
 
     def test_blocked_call_never_reaches_picoclaw_when_retries_run_out(self):
         bad = sse(*tool_chunks([(0, "c1", "exec", '{"command":"tailscale down"}')]))
@@ -436,11 +438,21 @@ class ProxyTests(unittest.TestCase):
         SCRIPT.extend([sse(*tool_chunks([(0, "c1", "send_file", '{"path":"/w/a.py"}')])),
                        sse(*tool_chunks([(0, "c2", "message", json.dumps({"content": self.LONG})),
                                          (1, "c3", "send_file", '{"path":"/w/a.py"}')]))])
-        _, raw = self.call(self.msg(), tool_names=self.NAMES)
+        _, raw = self.call(self.WORKED, tool_names=self.NAMES)
         self.assertEqual(len(SEEN), 2)
         self.assertIn("ENDS right after send_file", SEEN[1]["messages"][-1]["content"])
         calls = json.loads(raw)["choices"][0]["message"]["tool_calls"]
         self.assertEqual([c["function"]["name"] for c in calls], ["message", "send_file"])
+
+    WORKED = [{"role": "user", "content": "fix it"},
+              {"role": "assistant", "content": None, "tool_calls": [
+                  {"id": "w1", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}]},
+              {"role": "tool", "tool_call_id": "w1", "content": "File written"}]
+
+    def test_plain_send_me_the_file_request_needs_no_report(self):
+        SCRIPT.append(sse(*tool_chunks([(0, "c1", "send_file", '{"path":"/w/a.log"}')])))
+        self.call(self.msg("send me a.log"), tool_names=self.NAMES)
+        self.assertEqual(len(SEEN), 1)
 
     def test_message_then_send_file_in_one_response_is_accepted(self):
         SCRIPT.append(sse(*tool_chunks([(0, "c2", "message", json.dumps({"content": self.LONG})),
@@ -495,6 +507,80 @@ class ProxyTests(unittest.TestCase):
             self.assertIn(b"[DONE]", raw)                 # ...or, if pings already opened the stream, an in-band error
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 500)
+
+
+    # ---- long jobs must not stop by accident
+    def _task_ws(self, text, age=0):
+        import tempfile, time as _time
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "tasks"))
+        f = os.path.join(d, "tasks", "current.md")
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        if age:
+            os.utime(f, (_time.time() - age, _time.time() - age))
+        old = self.mod.WORKSPACE
+        self.mod.WORKSPACE = d
+        self.addCleanup(setattr, self.mod, "WORKSPACE", old)
+
+    MID = [{"role": "user", "content": "build it"},
+           {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "exec", "arguments": "{}"}}]},
+           {"role": "tool", "tool_call_id": "c1", "content": "ok"}]
+    SUMMARY = "Here is a summary of what I found in the logs so far, all three files were inspected carefully."
+
+    def test_text_reply_while_task_has_open_requirements_is_re_asked(self):
+        self._task_ws("# Task\nStatus: IN PROGRESS\n- [x] R1 read logs\n- [ ] R2 fix parser\n")
+        SCRIPT.extend([sse(*text_chunks(self.SUMMARY)), sse(*tool_chunks([(0, "c2", "exec", '{"command":"ls"}')]))])
+        _, raw = self.call(self.MID)
+        self.assertEqual(len(SEEN), 2)
+        self.assertIn("R2 fix parser", SEEN[1]["messages"][-1]["content"])
+        self.assertTrue(json.loads(raw)["choices"][0]["message"]["tool_calls"])
+
+    def test_no_re_ask_when_done_blocked_stale_question_or_fresh_user_message(self):
+        for text, age, msgs in [("# Task\nStatus: DONE\n- [ ] R1 x\n", 0, self.MID),
+                                ("# Task\nStatus: BLOCKED (geo-block)\n- [ ] R1 x\n", 0, self.MID),
+                                ("# Task\nStatus: IN PROGRESS\n- [ ] R1 x\n", 99999, self.MID),
+                                ("# Task\nStatus: IN PROGRESS\n- [ ] R1 x\n", 0, self.msg("hi")) ]:
+            SEEN.clear()
+            self._task_ws(text, age)
+            SCRIPT.append(sse(*text_chunks(self.SUMMARY)))
+            self.call(msgs)
+            self.assertEqual(len(SEEN), 1, (text, age))
+        SEEN.clear()
+        self._task_ws("# Task\nStatus: IN PROGRESS\n- [ ] R1 x\n")
+        SCRIPT.append(sse(*text_chunks("I need the password for the server to go on. Which one should I use?")))
+        self.call(self.MID)
+        self.assertEqual(len(SEEN), 1)                     # asking the user a question is a legitimate stop
+
+    def test_persistent_500_gives_up_early_but_429_keeps_retrying(self):
+        old = (self.mod.HTTP_RETRIES, self.mod.SERVER_ERR_RETRIES)
+        self.mod.HTTP_RETRIES, self.mod.SERVER_ERR_RETRIES = 20, 2
+        self.addCleanup(lambda: setattr(self.mod, "HTTP_RETRIES", old[0]) or setattr(self.mod, "SERVER_ERR_RETRIES", old[1]))
+        SCRIPT.extend([("status", 500)] * 6)
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.call(self.msg())
+        self.assertEqual(cm.exception.code, 500)
+        self.assertEqual(len(SEEN), 3)                   # 1 try + 2 retries, not 20
+
+    def test_long_burst_of_429_is_survived_with_default_style_retries(self):
+        old = self.mod.HTTP_RETRIES
+        self.mod.HTTP_RETRIES = 10
+        self.addCleanup(setattr, self.mod, "HTTP_RETRIES", old)
+        SCRIPT.extend([("status", 429)] * 8 + [sse(*text_chunks("finally ok ✅"))])
+        _, raw = self.call(self.msg())
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "finally ok ✅")
+        self.assertEqual(len(SEEN), 9)
+
+    def test_protection_has_no_false_positives_on_reading_and_workspace_work(self):
+        fv = self.mod.find_violation
+        for cmd in ["cp /usr/share/zoneinfo/UTC /root/.picoclaw/workspace/tz", "cat /etc/os-release > /tmp/os.txt",
+                    "python3 -c \"print(open('/etc/hostname').read())\"", "find /usr -name '*.py' | head",
+                    "curl -s https://example.com/usr/lib -o /tmp/x", "cd /root/.picoclaw/workspace && sed -i s/a/b/ scripts/x.py",
+                    "echo 'see /etc/hosts' > /root/.picoclaw/workspace/notes.txt", "du -sh /usr/lib | tail -1"]:
+            self.assertIsNone(fv(self._tc("exec", command=cmd)), cmd)
+        for cmd in ["cd /app && sed -i s/a/b/ start.sh", "cd /app; echo x > start.sh", "mv /app/start.sh /tmp/",
+                    "python3 -c \"open('/app/start.sh','w').write('x')\"", "curl -o /usr/local/bin/x http://a/b", "echo x >> /etc/hosts"]:
+            self.assertTrue(fv(self._tc("exec", command=cmd)), cmd)
 
 
     def test_upstream_error_is_passed_through_after_retries(self):

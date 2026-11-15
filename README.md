@@ -143,20 +143,20 @@ Limit: it only knows about work that goes through the LLM proxy; background `spa
 
 ## Dashboards from Telegram + protected server
 **Make a dashboard live (any topic):** tell the AI "dashboard live kar". It builds the page in `workspace/dashboards/<name>/`,
-runs `dash start <name> <folder>` and sends you the URL (`http://hermes:81xx/` or `http://100.x.y.z:81xx/`). Open it on any device
-that is logged in to your Tailscale - no extra setup. `bin/dash` only ever publishes ports 8100-8199 (own server: `dash start n --cmd "python3 app.py --port {port}" --dir folder`).
-`dash list|url|stop|restart`. After a server restart `start.sh` runs `dash restore`, so dashboards come back with the same URLs (registry is in the workspace, synced to Drive).
+runs `hdash start <name> <folder>` and sends you the URL (`http://hermes:81xx/` or `http://100.x.y.z:81xx/`). Open it on any device
+that is logged in to your Tailscale - no extra setup. `bin/hdash` only ever publishes ports 8100-8199 (own server: `hdash start n --cmd "python3 app.py --port {port}" --dir folder`).
+`hdash list|url|stop|restart`. After a server restart `start.sh` runs `hdash restore`, so dashboards come back with the same URLs (registry is in the workspace, synced to Drive).
 Needs the existing `TAILSCALE_AUTHKEY`; no new env var.
 
 **Protected server:** the proxy checks every tool call the model emits and blocks changes to `/app`, `/usr`, `/etc`, Tailscale
 (`up/down/serve/set`, `tailscaled`), `~/.picoclaw/config.json`, `.security.yml`, rclone config, killing proxy/gateway, and `rm` of top-level dirs.
-The model gets a `BLOCKED` message and is told to use `dash` or to ask you; if it keeps trying, the call is replaced by a refusal and never reaches PicoClaw.
+The model gets a `BLOCKED` message and is told to use `hdash` or to ask you; if it keeps trying, the call is replaced by a refusal and never reaches PicoClaw.
 Reading is allowed. Disable with `PROTECT_SYSTEM=0`. This is a guardrail on what the model asks for (string checks), not an OS sandbox:
 a determined obfuscated command could slip through. Real isolation = run the gateway as a non-root user with `/app` read-only (not done here).
 
 ## All ports on Tailscale (`tsports`)
 Koyeb exposes only one public port (10000). `bin/tsports watch` (started by `start.sh` right after Tailscale connects) scans every 5 s for
-TCP ports the server listens on (PicoClaw gateway 18790, web UI 18800, Hermes dashboard 9119, `dash` dashboards 81xx, anything new) and publishes
+TCP ports the server listens on (PicoClaw gateway 18790, web UI 18800, Hermes dashboard 9119, `hdash` dashboards 81xx, anything new) and publishes
 each with `tailscale serve --tcp=<port>`; ports that stop listening are removed after ~15 s. An index page with clickable links is on
 `http://hermes:8099/`; `tsports list` prints the same in the shell. Excluded by default: 1055 (Tailscale SOCKS), 18799 (LLM proxy, holds the API key), 22, 53 and ports above 32767 (ephemeral).
 Env: `TS_EXCLUDE_PORTS`, `TS_MAX_PORT`, `TS_INTERVAL`, `TS_INDEX_PORT` (0 = off). Non-HTTP ports are forwarded too but only open in a browser if they speak HTTP.
@@ -167,3 +167,22 @@ Only devices logged in to YOUR tailnet can reach them (nothing is public). Note:
 - Semantic retries (bad/empty/blocked replies) no longer run past PicoClaw's own request timeout - a late answer after PicoClaw gave up was simply lost.
 - Streaming clients (`stream=true`, Telegram streaming) get `: keep-alive` SSE comments every `LLM_SSE_KEEPALIVE`=8 s while the reply is validated, so PicoClaw does not time out on a silent socket. Errors after the first ping are reported in-band.
 - The log now says `typing keeper OFF: ...` at start if `TELEGRAM_BOT_TOKEN` / numeric `TELEGRAM_ALLOW_FROM` are missing.
+
+## Long jobs that stop "by themselves" - what was fixed
+Per-attempt timeout stays 10 min (`LLM_REQUEST_TIMEOUT`). Jobs of 30+ minutes with hundreds of requests (10 s ... 500 s each) are normal; these were the silent killers:
+1. **PicoClaw `max_tool_iterations` = 100** (default here) - a long job simply hit the cap. Now `LLM_MAX_TOOL_ITERATIONS` default **1000**.
+2. **Only 3 retries on 429/5xx/connection errors** (~14 s). A short burst of 429s (key pool cooling down) ended the job. Now retries run with backoff (max 30 s) until the request budget is used (`LLM_HTTP_RETRIES`=60).
+3. **PicoClaw gave up first.** Proxy retries / re-asks could run past PicoClaw's own `request_timeout` (= 600 s). Now each upstream attempt is still max 10 min, but one PicoClaw request has a total budget `LLM_TOTAL_BUDGET` (default 2x - 60 s = 1140 s) and PicoClaw is told to wait budget+120 s (1260 s).
+4. **A hung attempt** (no answer at all, or 408/504/524) is retried once if the budget allows (`LLM_TIMEOUT_RETRIES`=1; set 0 for the old behaviour).
+5. **Premature end:** a text-only reply ends a PicoClaw job. If the reply comes in the middle of work (after a tool result) while `tasks/current.md` (fresh, < 45 min) still has `- [ ]` items and no `Status: DONE/BLOCKED/WAITING`, the proxy asks the model once to continue or to state the blocker. Replies that end with a question to the user are never re-asked. Stalled "I will do X:" replies are now re-asked up to `LLM_GUARD_MAX_RETRIES` (2) times (was 1).
+6. **Protection false positives** could end a job with a refusal. The system-protection now blocks only real write targets (redirect, `rm/mv/cp/sed -i/tee/chmod ...`, `curl -o`, scripts with write calls, `cd /app && ...`), not mere mentions/reads of `/usr`, `/etc`, `/app`.
+7. **Crashes:** the proxy runs under a supervisor loop (restart in 2 s) and `start.sh` restarts the gateway after a crash (`PICOCLAW_MAX_RESTARTS`=20 quick crashes in a row, a run > 10 min resets the counter), with a Telegram notice.
+8. **Never a mystery:** when the proxy has to give up (API error after all retries, bad replies after all re-asks, request failure) you get a Telegram message with the reason and the hint to send `continue` (`LLM_NOTIFY_ERRORS=0` to disable, max 1/min). `[guard] ...` lines in the Koyeb log show every decision.
+Protocol: "continue" resumes from `tasks/current.md`; a text-only reply ends the job, so the model must call the next tool or write `Status: BLOCKED - <reason>`.
+
+## Final review fixes
+- **`dash` renamed to `hdash`**: `/app/bin` is first in PATH, so a helper called `dash` shadowed Debian's real `/usr/bin/dash` shell.
+- Requests without a guard (summaries, non-chat endpoints) now also have the retry time budget; before, 60 retries could keep hammering an already rate-limited API for ~30 min after PicoClaw had given up.
+- `500/502` retry only `LLM_SERVER_ERROR_RETRIES` (8) times (usually deterministic -> you hear about it early); `429/503`/connection errors keep retrying until the budget is used.
+- The "explain before send_file" rule applies only when work was done in the turn (write/edit/exec/...); a plain "send me that file" is not blocked or slowed.
+- `tsports`: if `tailscale serve status --json` fails it no longer re-publishes every port on every scan.

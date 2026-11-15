@@ -68,6 +68,18 @@ class TsPortsTests(unittest.TestCase):
         self.assertIn(9999, cur)
         self.assertEqual(run.calls, [])
 
+    def test_failing_serve_status_does_not_republish_everything_each_scan(self):
+        run = Run()
+        self.m.listeners = lambda *a, **k: {18800: "127.0.0.1"}
+        self.m.published = lambda: None                 # `tailscale serve status --json` keeps failing
+        self.m.KNOWN.clear()
+        self.m.sync(run=run)                            # first scan publishes
+        n = len(run.calls)
+        self.assertEqual(n, 1)
+        for _ in range(3):
+            self.m.sync(run=run)
+        self.assertEqual(len(run.calls), n)             # later scans remember what was published
+
     def test_index_page_lists_ports_with_urls(self):
         html = self.m.render_index({18800: "127.0.0.1:18800", 8123: "127.0.0.1:8123"})
         self.assertIn("http://hermes:18800/", html)

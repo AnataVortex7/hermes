@@ -1,6 +1,7 @@
 import json
 import os
 import socket
+import shlex
 import subprocess
 import sys
 import time
@@ -69,6 +70,11 @@ instructions.
 - Multi-step jobs (more than 2 steps): keep tasks/current.md as `# Task`, `Status`, `Requirements` ([ ] / [x]
   with evidence), `Plan`, `Log`. Update it after each step; set Status: DONE only when every item has evidence.
 - Do not delete or overwrite the user's data unless asked.
+- Never stop in the middle: after every tool result either call the next tool or give the final report. A text-only
+  reply ENDS the job. If you are blocked, say exactly why (set `Status: BLOCKED - <reason>` in tasks/current.md) instead of
+  going silent. Long jobs (30+ minutes, many steps) are normal: keep going until every requirement has evidence.
+- If the user says "continue" / "पुढे चालू ठेव" / "chalu thev": read tasks/current.md and resume at the first unchecked
+  requirement - do not restart and do not ask what to do.
 
 ### 4. Final answer (the answer is the product - never just "done" or a bare file)
 - Give the actual answer first, in the user's language and script (Roman Marathi -> Roman Marathi,
@@ -90,11 +96,11 @@ instructions.
 - "Make it live / open on my phone / share a link / dashboard" (any web page or app, any topic): build it in
   {{WORKSPACE}}/dashboards/<name>/ - static `index.html` (+css/js) is the simplest; for a server use a Python script
   that listens on `127.0.0.1:$PORT`. Then run ONE command:
-    `dash start <name> <folder>`                      (static folder)
-    `dash start <name> --cmd "python3 app.py --port {{port}}" --dir <folder>`   (your own server)
+    `hdash start <name> <folder>`                      (static folder)
+    `hdash start <name> --cmd "python3 app.py --port {{port}}" --dir <folder>`   (your own server)
   It picks a free port, starts it in the background, publishes it on the owner's Tailscale and prints the URLs.
-  Send those URLs to the user. Other commands: `dash list`, `dash url`, `dash stop <name>`, `dash restart <name>`.
-  Dashboards come back by themselves after a server restart. If `dash` reports an error, show its exact text; do not
+  Send those URLs to the user. Other commands: `hdash list`, `hdash url`, `hdash stop <name>`, `hdash restart <name>`.
+  Dashboards come back by themselves after a server restart. If `hdash` reports an error, show its exact text; do not
   touch Tailscale yourself.
 - All ports this server listens on are published to the owner's Tailscale automatically (index page: port 8099,
   `tsports list` shows them). A new server you start on any port 1-32767 appears within ~5 s; just tell the user
@@ -208,11 +214,25 @@ def main() -> None:
     proxy_env["LLM_REQUEST_TIMEOUT"] = str(request_timeout)
     proxy_env["LLM_FIRST_BYTE_TIMEOUT"] = str(first_byte_timeout)
     proxy_env["LLM_STREAM_IDLE_TIMEOUT"] = str(stream_idle_timeout)
-    proxy_env.setdefault("LLM_TIMEOUT_RETRIES", "0")
-    proxy_env["HERMES_WORKSPACE"] = workspace
+    # One PicoClaw request may contain several upstream attempts (each <= request_timeout): retries after 429/5xx,
+    # a second try after a hang, a re-ask after an empty reply. They must fit in total_budget, and PicoClaw is told to
+    # wait a little longer than that - otherwise PicoClaw gives up first and the job just stops.
+    try:
+        total_budget = int(os.environ.get("LLM_TOTAL_BUDGET", "").strip() or (2 * request_timeout - 60))
+    except ValueError:
+        total_budget = 2 * request_timeout - 60
+    total_budget = max(total_budget, request_timeout)
+    picoclaw_timeout = total_budget + 120
+    proxy_env["LLM_TOTAL_BUDGET"] = str(total_budget)
 
+    # The proxy is supervised: if it ever crashes (OOM, bug) it is restarted within 2 s instead of leaving every
+    # later request with "connection refused" (= the job silently stops).
+    supervisor = (
+        f"while true; do {shlex.quote(sys.executable)} {shlex.quote(str(proxy_script))}; "
+        f"echo \"[guard] llm_proxy exited with $? - restarting\" >> /tmp/stream_proxy.log; sleep 2; done"
+    )
     subprocess.Popen(
-        [sys.executable, str(proxy_script)],
+        ["bash", "-c", supervisor],
         env=proxy_env,          # stdout/stderr inherited -> `[guard] model=...` lines show up in Koyeb logs
         start_new_session=True,
     )
@@ -226,7 +246,7 @@ def main() -> None:
         "model": model,
         "api_key": api_key,
         "api_base": f"http://127.0.0.1:{proxy_port}/v1",
-        "request_timeout": request_timeout,
+        "request_timeout": picoclaw_timeout,
     }
 
     # Optional: extra JSON fields sent with every request to your custom API, e.g.
@@ -270,7 +290,7 @@ def main() -> None:
                 "restrict_to_workspace": False,
                 "allow_read_outside_workspace": True,
                 # let the agent finish multi-step jobs (install -> write script -> cron.add)
-                "max_tool_iterations": env_int("LLM_MAX_TOOL_ITERATIONS", 100),
+                "max_tool_iterations": env_int("LLM_MAX_TOOL_ITERATIONS", 1000),
                 # sub-agents (default 5 min) get the same >=10 min
                 "subturn": {"default_timeout_minutes": MIN_TIMEOUT // 60},
                 "context_window": context_window,
@@ -322,7 +342,8 @@ def main() -> None:
     config_path = picoclaw_home / "config.json"
     config_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     print(f"Generated unrestricted PicoClaw config at {config_path} (live stream proxy -> {upstream_base})")
-    print(f"context_window={context_window} max_tokens={max_tokens} request_timeout={request_timeout}s "
+    print(f"context_window={context_window} max_tokens={max_tokens} attempt_timeout={request_timeout}s "
+          f"total_budget={total_budget}s picoclaw_request_timeout={picoclaw_timeout}s "
           f"max_tool_iterations={cfg['agents']['defaults']['max_tool_iterations']}")
 
 

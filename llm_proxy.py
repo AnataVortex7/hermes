@@ -32,6 +32,7 @@ import random
 import re
 import shlex
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -61,12 +62,21 @@ TIMEOUT = _env_int("LLM_REQUEST_TIMEOUT", 600)
 
 GUARD = (os.environ.get("LLM_GUARD", "1").strip() != "0")
 REMINDER = (os.environ.get("LLM_REMINDER", "1").strip() != "0")
-HTTP_RETRIES = _env_int("LLM_HTTP_RETRIES", 3)          # transient upstream errors (429/5xx/conn)
+# Each upstream ATTEMPT may take up to TIMEOUT (default 10 min). One PicoClaw request may use several attempts
+# (retries after 429/5xx/timeouts, or a re-ask after an empty reply) as long as they fit in TOTAL_BUDGET;
+# setup_picoclaw.py gives PicoClaw a request_timeout slightly above it, so PicoClaw never gives up first.
+TOTAL_BUDGET = _env_int("LLM_TOTAL_BUDGET", 2 * TIMEOUT - 60)
+# Transient upstream errors (429/5xx/conn): keep retrying with backoff (max 30 s) until the budget is used up.
+# A job of 30+ minutes must not die because of a short burst of 429s or a restarting backend.
+HTTP_RETRIES = _env_int("LLM_HTTP_RETRIES", 60)
+# 500/502 are often deterministic (bad request, backend bug): fail after a few tries so the owner hears about it early,
+# instead of waiting the whole budget. 429/503/connection errors are usually temporary and keep retrying.
+SERVER_ERR_RETRIES = _env_int("LLM_SERVER_ERROR_RETRIES", 8)
 # Default 10 minutes (600 s) for first byte and stream idle so slow requests are not cut at 90-100 s.
 # TIMEOUT_RETRIES defaults to 0 so a slow/timed-out request does not automatically trigger a duplicate new request.
 FIRST_BYTE_TIMEOUT = _env_float("LLM_FIRST_BYTE_TIMEOUT", TIMEOUT)    # default 600s (10 min)
 STREAM_IDLE_TIMEOUT = _env_float("LLM_STREAM_IDLE_TIMEOUT", TIMEOUT)  # default 600s (10 min)
-TIMEOUT_RETRIES = _env_int("LLM_TIMEOUT_RETRIES", 0)    # default 0: do not send a new request on timeout/504
+TIMEOUT_RETRIES = _env_int("LLM_TIMEOUT_RETRIES", 1)    # 408/504/524 or no answer at all: one more attempt (0 = never) if the budget allows
 BAD_REPLY_RETRIES = _env_int("LLM_GUARD_MAX_RETRIES", 2)  # bad/empty/stalled replies
 BACKOFF = _env_float("LLM_RETRY_BACKOFF", 2.0)
 LITE_RE = re.compile(os.environ.get("LLM_LITE_PATTERN", "lite") or "lite", re.I)
@@ -336,6 +346,7 @@ def rewrite_send_file_result(payload):
 # so the model's final text is never produced or shown. The explanation must therefore be sent with the
 # `message` tool in the SAME response, before `send_file`.
 _TURN_ENDING_TOOLS = {"send_file"}
+_WORK_TOOLS = {"write_file", "edit_file", "append_file", "exec", "spawn", "subagent", "install_skill", "cron"}
 _SLOW_TOOLS = {"exec", "spawn", "subagent", "web_fetch", "web_search", "cron", "install_skill", "find_skills"}
 QUICK_TOOL_IDLE = float(os.environ.get("TYPING_QUICK_TOOL_IDLE", "150"))
 _MIN_EXPLANATION_CHARS = int(os.environ.get("MIN_EXPLANATION_CHARS", "120"))
@@ -367,14 +378,20 @@ def send_file_unexplained(payload, tool_calls):
     if not any(((c.get("function") or {}).get("name") in _TURN_ENDING_TOOLS) for c in calls):
         return False
     explained = False
+    did_work = False
     for m in reversed(payload.get("messages") or []):          # earlier in this same turn
         if not isinstance(m, dict):
             continue
         if m.get("role") == "user" and not str(m.get("content") or "").lstrip().startswith("[hermes-guard]"):
             break
         for c in m.get("tool_calls") or []:
-            if (c.get("function") or {}).get("name") == "message" and _longest_text(_tool_args(c)) >= _MIN_EXPLANATION_CHARS:
+            cname = (c.get("function") or {}).get("name")
+            if cname == "message" and _longest_text(_tool_args(c)) >= _MIN_EXPLANATION_CHARS:
                 explained = True
+            elif cname in _WORK_TOOLS:
+                did_work = True
+    if not did_work:                                             # plain "send me that file": no report needed
+        return False
     for c in calls:                                              # earlier in this response
         name = (c.get("function") or {}).get("name")
         if name == "message" and _longest_text(_tool_args(c)) >= _MIN_EXPLANATION_CHARS:
@@ -382,6 +399,29 @@ def send_file_unexplained(payload, tool_calls):
         elif name in _TURN_ENDING_TOOLS and not explained:
             return True
     return False
+
+
+# Claude/Gemini sometimes ends a long job with a text-only reply although the plan in tasks/current.md still has
+# open requirements. PicoClaw treats a text-only reply as "turn finished" -> the job just stops. If we are in the
+# middle of work (last message is a tool result) and the live task file has unchecked items, ask once more.
+TASK_FRESH_SECS = _env_int("LLM_TASK_FRESH_SECS", 2700)      # ignore a stale task file (> 45 min old)
+_TASK_DONE_RE = re.compile(r"status\s*:?\s*\**\s*(done|blocked|waiting|cancel|paused|complete)", re.I)
+
+
+def open_task_items(path=None):
+    """Unchecked requirement lines of the live task file, or [] (no file / stale / DONE / BLOCKED / WAITING)."""
+    path = path or os.path.join(os.path.expanduser(WORKSPACE), "tasks", "current.md")
+    try:
+        if time.time() - os.path.getmtime(path) > TASK_FRESH_SECS:
+            return []
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return []
+    head = "\n".join(text.splitlines()[:12])
+    if _TASK_DONE_RE.search(head):
+        return []
+    return [ln.strip() for ln in text.splitlines() if re.match(r"\s*[-*]\s*\[ \]", ln)]
 
 
 def classify(comp, payload):
@@ -417,7 +457,32 @@ def classify(comp, payload):
         return "no_explanation"
     if payload.get("tools") and looks_stalled(content, last_role):
         return "stalled"
+    if payload.get("tools") and last_role == "tool" and not content.rstrip().endswith(("?", "؟", "？")):
+        items = open_task_items()
+        if items:
+            comp["_open_items"] = items[:4]
+            return "premature_end"
     return None
+
+
+# --------------------------------------------------------------------------- tell the owner when a job really stopped
+_last_notice = [0.0]
+
+
+def notify_owner(text):
+    """Telegram message (via notify.py) when the proxy has to give up, so a stopped job is never a mystery. Max 1/min."""
+    if os.environ.get("LLM_NOTIFY_ERRORS", "1").strip() == "0":
+        return
+    now = time.time()
+    if now - _last_notice[0] < 60:
+        return
+    _last_notice[0] = now
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notify.py")
+    try:
+        subprocess.Popen([sys.executable, script, text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception as exc:  # noqa: BLE001
+        log(f"notify failed: {exc!r}")
 
 
 # --------------------------------------------------------------------------- system protection
@@ -438,7 +503,7 @@ _SPLIT_RE = re.compile(r"&&|\|\||[;|\n]")
 _KILL_RE = re.compile(r"\b(?:pkill|killall|kill)\b.*(?:tailscaled|llm_proxy|keep_alive|start\.sh|picoclaw)", re.I)
 _RMROOT_RE = re.compile(r"\brm\b[^;|&\n]*\s(?:/|~|\$HOME|/root|/root/\.picoclaw|/root/\.picow_clow)/?(?=\s|$)")
 _WRITE_TOOLS = {"write_file", "edit_file", "append_file"}
-_DASH_HINT = ("To publish a dashboard use `dash start <name> <folder>` (it prints the Tailscale URL). "
+_DASH_HINT = ("To publish a dashboard use `hdash start <name> <folder>` (it prints the Tailscale URL). "
               "Do not change system files, Tailscale or config yourself; if a change is really needed, "
               "tell the user exactly what to change and why, and stop.")
 
@@ -447,7 +512,26 @@ def _norm(text):
     return (text or "").replace("~/", "/root/").replace("$HOME", "/root").replace("${HOME}", "/root")
 
 
-def _segment_violation(seg):
+_WRITE_VERBS = {"rm", "mv", "touch", "mkdir", "rmdir", "chmod", "chown", "ln", "truncate", "install", "tee", "shred", "unlink"}
+_INTERP = {"python", "python3", "node", "perl", "ruby", "php", "bash", "sh", "zsh"}
+_INTERP_WRITE_RE = re.compile(r"open\([^)]*,\s*['\"][^'\"]*[wax+]|\.write|write_text|write_bytes|unlink|remove\(|rmtree|rename|\.replace\(|"
+                              r"shutil|os\.system|subprocess|sed\s+-i|\bcp\b|\bmv\b|\brm\b|>\s*\S|\btee\b|chmod|chown", re.I)
+_REDIR_RE = re.compile(r"(?<![<>&\d])>{1,2}\s*([^\s;|&<>]+)")
+
+
+def _is_prot(arg, cwd_prot=False):
+    a = _norm(arg)
+    if a in ("/dev/null", "/dev/stdout", "/dev/stderr"):
+        return False
+    if _PROT_PATH_RE.search(a):
+        return True
+    return bool(cwd_prot and a and not a.startswith(("/", "~", "-", "$")))      # relative path while cd'ed into /app
+
+
+def _segment_violation(seg, cwd_prot=False):
+    """Only what actually WRITES to a protected place is blocked (reading /usr, /etc, /app is fine).
+
+    A false positive stops a long job, so this checks write targets, not mere mentions of a path."""
     seg = seg.strip()
     if not seg:
         return None
@@ -476,17 +560,28 @@ def _segment_violation(seg):
         if sub and sub not in _TS_READ_SUBS:
             return f"`tailscale {sub}` (changes Tailscale)"
         return None
-    if _PROT_PATH_RE.search(_norm(seg)):
-        if head in ("python", "python3") and re.search(r"/app/notify\.py\b", seg):
+    for m in _REDIR_RE.finditer(seg):                       # echo x > /app/start.sh
+        if _is_prot(m.group(1), cwd_prot):
+            return "redirecting output into a protected system path"
+    args = [t for t in toks[1:] if not t.startswith("-")]
+    if head in _WRITE_VERBS and any(_is_prot(a, cwd_prot) for a in args):
+        return f"`{head}` on a protected system path"
+    if head == "cp" and args and _is_prot(args[-1], cwd_prot):
+        return "`cp` into a protected system path"
+    if head in ("sed", "perl") and any(t in ("-i", "--in-place") or t.startswith("-i") or re.fullmatch(r"-[a-z]*i[a-z]*", t) for t in toks[1:]) \
+            and any(_is_prot(a, cwd_prot) for a in args):
+        return "in-place edit of a protected system file"
+    if head == "dd" and any(t.startswith("of=") and _is_prot(t[3:], cwd_prot) for t in toks[1:]):
+        return "`dd` onto a protected system path"
+    if head in ("curl", "wget"):
+        for i, t in enumerate(toks[1:], 1):
+            if t in ("-o", "-O", "--output", "-P", "--directory-prefix") and i + 1 < len(toks) and _is_prot(toks[i + 1], cwd_prot):
+                return f"`{head}` download into a protected system path"
+    if head in _INTERP and _PROT_PATH_RE.search(_norm(seg)):
+        if re.search(r"/app/notify\.py\b", seg):
             return None
-        write_marks = (">" in seg) or re.search(r"\s-i\b|--in-place|\btee\b|-delete\b|-exec\b|\bchmod\b|\bchown\b", seg)
-        if head in _READ_CMDS and not write_marks:
-            return None
-        if head == "sed" and re.search(r"\s-n\b", seg) and not write_marks:
-            return None
-        if head == "find" and not write_marks:
-            return None
-        return "writing to a protected system path"
+        if _INTERP_WRITE_RE.search(seg):
+            return "a script that writes to a protected system path"
     return None
 
 
@@ -521,10 +616,14 @@ def find_violation(tool_calls):
                 return "killing a core service (tailscaled / proxy / gateway / start.sh)"
             if _RMROOT_RE.search(cmd):
                 return "deleting a top-level / workspace directory"
+            cwd_prot = False
             for seg in _SPLIT_RE.split(cmd):
-                why = _segment_violation(seg)
+                why = _segment_violation(seg, cwd_prot)
                 if why:
                     return why
+                st = seg.strip().split()
+                if len(st) >= 2 and st[0] == "cd":
+                    cwd_prot = _is_prot(st[1])
     return None
 
 
@@ -609,6 +708,11 @@ def inject_reminder(payload, strong):
 
 def append_nudge(payload, reason, comp=None):
     text = NUDGES.get(reason)
+    if reason == "premature_end":
+        text = ("[hermes-guard] You replied with plain text, but tasks/current.md still has open requirements: "
+                + " | ".join((comp or {}).get("_open_items", [])[:4])
+                + ". If they are really finished, tick them with evidence and set Status: DONE; if you are blocked, set "
+                "Status: BLOCKED with the exact reason and tell the user. Otherwise do NOT stop - call the next tool now.")
     if reason == "protected":
         text = (f"[hermes-guard] BLOCKED: {(comp or {}).get('_violation', 'system change')}. "
                 "The owner has protected the server (app code, Tailscale, bot/API config). " + _DASH_HINT)
@@ -632,12 +736,15 @@ def open_upstream(method, target_url, headers, body, deadline=None):
     conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
-    http_fail = slow_fail = 0
+    http_fail = slow_fail = err5xx = 0
     while True:
         conn = resp = err = None
         t0 = time.time()
         try:
-            conn = conn_cls(parsed.hostname, port, timeout=FIRST_BYTE_TIMEOUT)
+            tmo = FIRST_BYTE_TIMEOUT
+            if deadline is not None:                      # never wait past what PicoClaw is still willing to wait
+                tmo = min(tmo, max(15.0, deadline + 30 - time.time()))
+            conn = conn_cls(parsed.hostname, port, timeout=tmo)
             conn.request(method, path, body=body if body else None, headers=headers)
             resp = conn.getresponse()
         except (socket.timeout, TimeoutError) as exc:
@@ -661,7 +768,9 @@ def open_upstream(method, target_url, headers, body, deadline=None):
             limit = f"{slow_fail}/{TIMEOUT_RETRIES}"
         else:
             http_fail += 1
-            allowed = http_fail <= HTTP_RETRIES
+            if resp is not None and resp.status in (500, 502):
+                err5xx += 1
+            allowed = http_fail <= HTTP_RETRIES and err5xx <= SERVER_ERR_RETRIES
             wait = _retry_wait(resp, http_fail - 1) if resp is not None else min(BACKOFF * (2 ** (http_fail - 1)) + random.random(), 30.0)
             limit = f"{http_fail}/{HTTP_RETRIES}"
         what = f"HTTP {resp.status}" if resp is not None else repr(err)
@@ -884,6 +993,8 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             if TYPING is not None:
                 TYPING.finish()               # request failed: do not leave "typing..." on
+            log(f"request failed: {exc!r}")
+            notify_owner(f"⚠️ LLM request fail झाला: {str(exc)[:200]}. काम थांबलं असू शकतं — 'continue' पाठवा.")
             try:
                 self._finish_ka()
                 if getattr(self, "_sse_open", False):
@@ -894,7 +1005,8 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
                 pass
 
     def _passthrough(self, target_url, body, client_wants_stream):
-        conn, resp = open_upstream(self.command, target_url, self._forward_headers(body), body)
+        conn, resp = open_upstream(self.command, target_url, self._forward_headers(body), body,
+                                       time.time() + max(TOTAL_BUDGET - 30, 60))
         try:
             ctype = (resp.getheader("Content-Type") or "").lower()
             if resp.status == 200 and "text/event-stream" in ctype:
@@ -1010,13 +1122,13 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
         if agent_turn and TYPING is not None:
             TYPING.touch()                  # turn started / continues after a tool: keep "typing..." on
         semantic_retries = 0
-        stall_retried = False
         read_failures = 0
         call_started = time.time()
-        retry_deadline = call_started + max(TIMEOUT - 30, 60)   # stay inside PicoClaw's own request timeout
-        hard_deadline = call_started + TIMEOUT
+        retry_deadline = call_started + max(TOTAL_BUDGET - 30, 60)   # stay inside PicoClaw's own request timeout
+        premature_retried = False
         while True:
             started = time.time()
+            hard_deadline = min(started + TIMEOUT, call_started + TOTAL_BUDGET)   # per attempt, never past the budget
             if agent_turn and TYPING is not None:
                 TYPING.touch()
             body = json.dumps(payload).encode("utf-8")
@@ -1036,6 +1148,9 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
             if comp is None:                      # upstream error / non-completion: pass it on
                 if agent_turn and TYPING is not None:
                     TYPING.finish()
+                if agent_turn:
+                    notify_owner(f"⚠️ LLM API ने error दिला (HTTP {getattr(resp, 'status', '?')}) — retries नंतरही. "
+                                 f"काम मधेच थांबलं असू शकतं. 'continue' पाठवा, मी tasks/current.md वरून पुढे चालू करतो.")
                 self._finish_ka()
                 if getattr(self, "_sse_open", False):          # 200 + keep-alives already sent: report in-band
                     self._sse_error(raw[:300].decode("utf-8", "replace") if isinstance(raw, bytes) else raw)
@@ -1081,22 +1196,27 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
                 reason is not None
                 and semantic_retries < BAD_REPLY_RETRIES
                 and not _expired(retry_deadline)          # a late answer after PicoClaw gave up is lost
-                and not (reason == "stalled" and stall_retried)
+                and not (reason == "premature_end" and premature_retried)
                 and reason != "no_choices"
             )
             if not can_retry:
+                if reason in ("empty", "stalled", "premature_end", "truncated_text", "incomplete_stream", "truncated_tool_call", "bad_tool_json"):
+                    log(f"giving up on '{reason}' after {semantic_retries} re-asks: the job may stop here")
+                    notify_owner(f"⚠️ Model ने {semantic_retries} वेळा नंतरही नीट reply दिला नाही ({reason}). "
+                                 f"काम इथे थांबलं असू शकतं — 'continue' पाठवा.")
                 if reason == "protected":     # retries used up: never let the blocked call through
                     ch0 = comp["choices"][0]
                     ch0["message"] = {"role": "assistant", "content":
                         f"⛔ मी हे करू शकत नाही: {comp.get('_violation')}. सर्व्हर सिस्टम (app code, Tailscale, config) "
-                        "मालकाने protected ठेवली आहे. Dashboard live करायचा असेल तर मी `dash start` वापरतो; "
+                        "मालकाने protected ठेवली आहे. Dashboard live करायचा असेल तर मी `hdash start` वापरतो; "
                         "सिस्टम बदल हवा असेल तर तो तुम्हाला repo मध्ये करावा लागेल."}
                     ch0["finish_reason"] = "stop"
                 comp.pop("_violation", None)
+                comp.pop("_open_items", None)
                 _deliver(comp)
                 return
             semantic_retries += 1
-            stall_retried = stall_retried or reason == "stalled"
+            premature_retried = premature_retried or reason == "premature_end"
             append_nudge(payload, reason, comp)
             time.sleep(1.0)
 

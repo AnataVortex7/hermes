@@ -10,7 +10,7 @@ Open:  http://<TAILSCALE_HOSTNAME>:8099/  (index of all ports)   or   http://<ho
 Env: TS_EXCLUDE_PORTS (default 1055,18799,22,53)  TS_MAX_PORT (default 32767: ephemeral ports are ignored)
      TS_INTERVAL (default 5)  TS_INDEX_PORT (default 8099, 0 = no index page)  TS_SOCKET  TAILSCALE_HOSTNAME
 """
-import html, http.server, json, os, socket, subprocess, sys, threading, time
+import html, http.server, json, os, subprocess, sys, threading, time
 
 TS_SOCK = os.environ.get("TS_SOCKET", "/tmp/tailscale/tailscaled.sock")
 HOSTNAME = os.environ.get("TAILSCALE_HOSTNAME", "hermes")
@@ -18,6 +18,7 @@ EXCLUDE = {int(x) for x in os.environ.get("TS_EXCLUDE_PORTS", "1055,18799,22,53"
 MAX_PORT = int(os.environ.get("TS_MAX_PORT", "32767"))
 INTERVAL = float(os.environ.get("TS_INTERVAL", "5"))
 INDEX_PORT = int(os.environ.get("TS_INDEX_PORT", "8099"))
+KNOWN = {}                          # what we published ourselves (fallback if `serve status --json` fails)
 GONE_AFTER = 3                      # scans a port must be missing before it is un-published
 
 
@@ -39,7 +40,8 @@ def listeners(files=("/proc/net/tcp", "/proc/net/tcp6")):
     out = {}
     for fn in files:
         try:
-            lines = open(fn).read().splitlines()[1:]
+            with open(fn) as fh:
+                lines = fh.read().splitlines()[1:]
         except OSError:
             continue
         for ln in lines:
@@ -67,13 +69,20 @@ def published():
         data = json.loads(r.stdout or "{}")
         return {int(k): (v.get("TCPForward") or "") for k, v in (data.get("TCP") or {}).items()}
     except Exception:
-        return {}
+        return None                    # unknown (tailscale hiccup / old version): caller keeps its own record
 
 
 def sync(run=ts, current=None, missing=None):
     """One scan: publish new ports, un-publish gone ones. Returns {port: forward} that are published."""
     now = wanted(listeners())
-    cur = published() if current is None else current
+    if current is None:
+        pub = published()
+        cur = dict(KNOWN) if pub is None else dict(pub)      # copy: KNOWN is cleared below
+        KNOWN.clear()
+        KNOWN.update(cur)
+        cur = KNOWN
+    else:
+        cur = current
     missing = {} if missing is None else missing
     for p, ip in now.items():
         missing.pop(p, None)

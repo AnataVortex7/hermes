@@ -250,8 +250,8 @@ if command -v picoclaw >/dev/null 2>&1 && run_logged /tmp/setup_picoclaw.log pyt
   TAIL_PID=$!
   picoclaw gateway >> /tmp/picoclaw.log 2>&1 &
   APP_PID=$!
-  # bring back dashboards published earlier with `dash start` (waits for Tailscale itself)
-  ( dash restore >> /tmp/dash.log 2>&1 & ) 2>/dev/null
+  # bring back dashboards published earlier with `hdash start` (waits for Tailscale itself)
+  ( hdash restore >> /tmp/dash.log 2>&1 & ) 2>/dev/null
 
   # Wait up to 120s in the main shell to verify PicoClaw is up (gateway /ready == 200) or detect early crash.
   HP="${PICOCLAW_HEALTH_PORT:-18790}"
@@ -307,18 +307,37 @@ ${ERR_LOG}"
     fi
   fi
 
-  wait "$APP_PID"
-  EXIT_CODE=$?
-  if [ ! -f /tmp/shutting_down ]; then
+  # Supervise the gateway: if it crashes (panic / OOM kill) restart it automatically instead of leaving the bot dead
+  # until someone redeploys. A run that lasted > 10 min resets the counter; > PICOCLAW_MAX_RESTARTS quick crashes in a
+  # row = give up (crash loop) and tell the owner.
+  MAX_RESTARTS="${PICOCLAW_MAX_RESTARTS:-20}"
+  RESTARTS=0
+  RUN_START=$(date +%s)
+  while true; do
+    wait "$APP_PID"
+    EXIT_CODE=$?
+    [ -f /tmp/shutting_down ] && break
     sleep 1
+    RAN=$(( $(date +%s) - RUN_START ))
+    if [ "$RAN" -gt 600 ]; then RESTARTS=1; else RESTARTS=$((RESTARTS + 1)); fi
     ERR_LOG=$(collect_error_logs)
-    echo ">> PicoClaw exited unexpectedly with code $EXIT_CODE"
-    notify "❌ PicoClaw अचानक बंद पडला (exit code: ${EXIT_CODE}).
+    echo ">> PicoClaw exited unexpectedly with code $EXIT_CODE after ${RAN}s (restart #$RESTARTS)"
+    if [ "$RESTARTS" -gt "$MAX_RESTARTS" ]; then
+      notify "❌ PicoClaw वारंवार बंद पडतोय (${MAX_RESTARTS} वेळा, exit code: ${EXIT_CODE}). Auto-restart थांबवला.
 
 📋 Error Log:
 ${ERR_LOG}"
-    sleep infinity
-  fi
+      sleep infinity
+    fi
+    notify "⚠️ PicoClaw अचानक बंद पडला (exit code: ${EXIT_CODE}, ${RAN}s नंतर) — आपोआप परत सुरू करतोय (#${RESTARTS}). चालू काम असेल तर 'continue' पाठवा.
+
+📋 Error Log:
+${ERR_LOG}"
+    sleep 3
+    picoclaw gateway >> /tmp/picoclaw.log 2>&1 &
+    APP_PID=$!
+    RUN_START=$(date +%s)
+  done
 elif [ -f /app/main.py ]; then
   echo ">> Starting main.py..."
   python3 /app/main.py
