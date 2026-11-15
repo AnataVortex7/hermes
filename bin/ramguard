@@ -1,0 +1,3 @@
+#!/bin/bash
+# ramguard status | log  - free RAM, biggest agent jobs, recent RAM-guard kills
+exec python3 /app/ram_guard.py "${@:-status}"

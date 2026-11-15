@@ -212,3 +212,46 @@ Protocol: "continue" resumes from `tasks/current.md`; a text-only reply ends the
 **Set your plan's allotment** (a container cannot always read it): `RAM_LIMIT_MB` (default: cgroup limit, else 512), `CPU_LIMIT` in cores (default: cgroup quota, else 0.1), `DISK_LIMIT_MB` (default 2000). The disk limit is never visible from inside, so set it to what your plan gives.
 Slow work (disk scan, process scan) is in a background thread and the server is threaded, so the platform health check on `/` can no longer be blocked by a stats request.
 **`/picoclaw`** replaces the old `/dashboard` (it forwarded to a Hermes dashboard on 9119 that nothing starts any more; removed). `/picoclaw` shows the PicoClaw web UI if something listens on `PICOCLAW_UI_PORT` (18800) - links are rewritten best-effort, WebSockets are not supported through this route (use Tailscale `:18800` for those) - otherwise a built-in status page (gateway `/ready` + `/health`, LLM guard proxy, UI up/down); `/picoclaw/status.json` is the same as JSON. The route is **public** unless you set `UI_BASIC_AUTH=user:password`.
+
+## RAM guard (kills the job that spikes RAM, before Linux OOM does)
+`ram_guard.py` (started by `start.sh`, supervised) keeps your **allotted** RAM safe.
+
+**Accurate RAM (your plan, not the host).** Limit = the smallest of `RAM_LIMIT_MB` (you set it), the cgroup limit (all
+levels) and `/proc/meminfo` MemTotal (a microVM / sandbox shows only its plan there; ignored if it looks like the host,
+> 8 GB or above the cgroup limit). Used = the **higher** of the cgroup working set and system used (MemTotal - MemAvailable).
+Check it: `ramguard status` prints the limit, where it came from and both readings. Compare with your host dashboard;
+if the limit is wrong or says `UNKNOWN`, set `RAM_LIMIT_MB` (e.g. `512`). The guard also messages you its detected limit at every boot.
+
+**Speed.** Polls every 0.1 s when calm, 0.02 s from 75% and 0.01 s near the limit (about 0.4% of one core calm, ~18 MB RSS).
+Besides the 91% line it kills early when the growth rate says RAM would reach ~99% within 0.4 s, and whenever free RAM
+would drop under 32 MB (small plans). The guard runs with `oom_score_adj=-1000`, higher priority and `mlockall` (when
+allowed) so it is never the OOM victim and never stalls. If Linux still kills something, the guard notices (OOM counter)
+and lowers its own threshold by 3 points (min 70%) and tells you.
+Measured in a test box (limit 300 MB): a 1 GB/s runaway was cut at ~66%, 250 MB/s at ~81%, slow growth at ~90%.
+
+**What it kills.** At the threshold it picks the agent job that **grew the most in the last 20 s** (no history: the one
+**started last**); a job = the command + all its children (a script + its Chromium), shell wrappers are looked through.
+It `SIGKILL`s the whole job; if RAM is still high it takes the next culprit (max 3). Jobs under 25 MB that are not growing are never picked.
+The event goes to `/tmp/ram_guard/events.jsonl`; `llm_proxy.py` then appends a `[hermes-ram-guard]` message to the agent's
+next 3 requests: what was killed, why, and lighter alternatives (requests instead of a browser, chunks/streaming, one
+heavy job at a time ...), plus "do not repeat the same command". You also get a Telegram message.
+
+**Never killed:** PicoClaw gateway, keep_alive.py, llm_proxy.py, ram_guard.py, start.sh, tailscaled, rclone, notify.py,
+tsports (+ children of those services). If one of those is the biggest process, nothing is killed, only reported (max 1 message / 5 min).
+
+Agent commands: `ramguard status`, `ramguard log`.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `RAM_GUARD` | `1` | `0` = off |
+| `RAM_LIMIT_MB` | auto | your plan's RAM, overrides detection |
+| `RAM_GUARD_PERCENT` | `91` | kill threshold, % of the allotted RAM |
+| `RAM_GUARD_MIN_FREE_MB` | `32` | also cut when free RAM < this (`0` = off) |
+| `RAM_GUARD_WATCH` | `75` | above this, scan processes fast and keep growth history |
+| `RAM_GUARD_PREDICT` / `RAM_GUARD_LOOKAHEAD` | `1` / `0.4` | early kill on a runaway growth rate |
+| `RAM_GUARD_TICK` | `0.1` | calm polling seconds (0.02 / 0.01 when RAM fills) |
+| `RAM_GUARD_MIN_MB` / `RAM_GUARD_MIN_GROW_MB` | `25` / `15` | size / growth needed to count as culprit |
+| `RAM_GUARD_PROTECT` | - | extra regex of command lines that must never be killed |
+| `RAM_GUARD_NOTIFY` / `RAM_GUARD_MLOCK` | `1` / `1` | Telegram message / lock guard pages in RAM |
+
+A kill is `SIGKILL`: the job cannot save, so the agent is told to continue in small batches.

@@ -12,6 +12,16 @@ if [ -f /app/keep_alive.py ]; then
   python3 /app/keep_alive.py &
 fi
 
+# 1a. RAM GUARD: kills the agent job that spikes RAM >= 91% (before the Linux OOM killer), supervised.
+if [ -f /app/ram_guard.py ] && [ "${RAM_GUARD:-1}" != "0" ]; then
+  (
+    while [ ! -f /tmp/shutting_down ]; do
+      python3 /app/ram_guard.py >> /tmp/ram_guard.log 2>&1
+      sleep 2
+    done
+  ) &
+fi
+
 BOOT_TS=$(date +%s)
 notify() { python3 /app/notify.py "$1" >/dev/null 2>&1 || true; }
 

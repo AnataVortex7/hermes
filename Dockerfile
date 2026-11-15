@@ -40,6 +40,7 @@ WORKDIR /app
 
 COPY keep_alive.py /app/keep_alive.py
 COPY sysstats.py /app/sysstats.py
+COPY ram_guard.py /app/ram_guard.py
 COPY start.sh /app/start.sh
 COPY setup_picoclaw.py /app/setup_picoclaw.py
 COPY llm_proxy.py /app/llm_proxy.py

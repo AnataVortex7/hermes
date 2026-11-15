@@ -706,6 +706,63 @@ def inject_reminder(payload, strong):
         return payload
     return payload
 
+# --------------------------------------------------------------------------- ram guard notice
+RAM_EVENTS = os.path.join(os.environ.get("RAM_GUARD_DIR", "/tmp/ram_guard"), "events.jsonl")
+RAM_NOTICE_TTL = _env_int("RAM_GUARD_NOTICE_TTL", 900)     # seconds an event keeps being shown to the agent
+RAM_NOTICE_MAX = _env_int("RAM_GUARD_NOTICE_MAX", 3)       # ... and how many agent requests it is shown in
+_ram_lock = threading.Lock()
+
+
+def ram_guard_notice():
+    """Text for the agent when ram_guard.py killed one of its processes recently (else ''). Shown in the next few
+    agent requests only (not stored in history), so the model stops repeating the same heavy approach."""
+    try:
+        with open(RAM_EVENTS, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()[-5:]
+    except OSError:
+        return ""
+    now, shown, parts, changed = time.time(), [], [], False
+    for ln in lines:
+        try:
+            ev = json.loads(ln)
+        except ValueError:
+            continue
+        if ev.get("killed") and now - ev.get("t", 0) <= RAM_NOTICE_TTL and ev.get("shown", 0) < RAM_NOTICE_MAX:
+            ev["shown"] = ev.get("shown", 0) + 1
+            changed = True
+            parts.append(
+                f"[hermes-ram-guard] The server RAM guard KILLED your process `{ev['cmd'][:160]}` "
+                f"(pid {ev['pid']}, {ev['job_mb']} MB, grew {ev['grew_mb']} MB just before) because container RAM went "
+                f"{ev['before_percent']}% -> over the {ev['limit_mb']} MB limit; it was killed to protect the server "
+                "(the Linux OOM killer would have killed something important). Its output may be incomplete. "
+                "Do NOT rerun the same command the same way. Use a lighter/smarter alternative: "
+                + " | ".join(ev.get("tips", [])) + ". Run `ramguard status` to see free RAM, then continue the task "
+                "step by step with small batches, and tell the user briefly what happened and what you changed.")
+        shown.append(ev)
+    if changed:
+        with _ram_lock:
+            try:
+                with open(RAM_EVENTS, "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(json.dumps(e, ensure_ascii=False) for e in shown) + "\n")
+            except OSError:
+                pass
+    return "\n".join(parts)
+
+
+def inject_ram_notice(payload):
+    text = ram_guard_notice()
+    if not text:
+        return payload
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list) or not msgs or not isinstance(msgs[-1], dict) or msgs[-1].get("role") not in ("user", "tool"):
+        return payload
+    last = msgs[-1]
+    if isinstance(last.get("content"), str):
+        last["content"] += "\n\n" + text
+    elif isinstance(last.get("content"), list):
+        last["content"].append({"type": "text", "text": text})
+    return payload
+
 
 def append_nudge(payload, reason, comp=None):
     text = NUDGES.get(reason)
@@ -1286,6 +1343,8 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
             prev_bad = _state["last_was_bad"]
         if guard_on and REMINDER:
             inject_reminder(payload, strong=prev_lite or prev_bad)
+        if guard_on:
+            inject_ram_notice(payload)
 
         if agent_turn and TYPING is not None:
             TYPING.touch()                  # turn started / continues after a tool: keep "typing..." on

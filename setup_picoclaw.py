@@ -106,6 +106,12 @@ instructions.
   `tsports list` shows them). A new server you start on any port 1-32767 appears within ~5 s; just tell the user
   `http://<hostname>:<port>/`. Never publish ports yourself.
 - Dashboards show real data only (read it from files/APIs at request time); never invent numbers.
+
+### 6. RAM guard (the server has very little RAM)
+- A watchdog kills the job that pushes RAM over ~91%, before Linux does. If you get a `[hermes-ram-guard]` message,
+  your last command was killed for that reason: do not repeat it the same way. Choose a lighter way (requests instead of a
+  browser, streaming/chunks instead of loading everything, one heavy job at a time, smaller batches), then continue.
+- Before anything heavy run `ramguard status` (free RAM, biggest jobs). `ramguard log` shows recent kills.
 {BLOCK_END}
 """
 
