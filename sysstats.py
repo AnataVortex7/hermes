@@ -15,7 +15,7 @@ CPU time (clearly labelled in `source`).
 
 Limits (what your plan allots) cannot always be read from inside, so they can be set:
   RAM_LIMIT_MB (default: cgroup limit, else 512)   CPU_LIMIT in cores (default: cgroup quota, else 0.1)
-  DISK_LIMIT_MB (default 2000)
+  DISK_LIMIT_MB (default 15360 = 15 GB)
 Everything slow (disk `du`, per-process scan) runs in a background thread; reading a snapshot never blocks.
 
 Low overhead: only ONE cgroup file is read every 10 s while nobody looks (keeps the 1m/5m/15m averages alive).
@@ -331,16 +331,16 @@ class Stats:
 
     def disk(self):
         try:
-            limit = float(self.env.get("DISK_LIMIT_MB") or 2000)
+            limit = float(self.env.get("DISK_LIMIT_MB") or 15360)
         except ValueError:
-            limit = 2000.0
+            limit = 15360.0
         with self._lock:
             d = dict(self._disk)
         used = round(d["used_mb"], 1)
         return {"total_mb": limit, "used_mb": used, "free_mb": max(0.0, round(limit - used, 1)),
                 "percent": min(100.0, round(100.0 * used / limit, 1)), "parts": d["parts"],
                 "measured": "du -x of " + ", ".join(self.disk_paths),
-                "limit_source": "env DISK_LIMIT_MB" if self.env.get("DISK_LIMIT_MB") else "default 2000 MB"}
+                "limit_source": "env DISK_LIMIT_MB" if self.env.get("DISK_LIMIT_MB") else "default 15 GB"}
 
     # ------------------------------------------------------------------ uptime
     def uptime_seconds(self):
