@@ -87,6 +87,54 @@ class StatusMessageTests(unittest.TestCase):
         self.assertTrue(wait_for(lambda: any("activity नाही" in (x or "") for x in tg.texts())))
         self.assertNotIn("deleteMessage", tg.methods())
 
+    # ---- time since the last tool call
+    def test_ago_has_minute_resolution(self):
+        a = m.StatusMessage.ago
+        self.assertEqual((a(0), a(59), a(60), a(125), a(3599), a(3600), a(3900), a(-5)), ("<1m", "<1m", "1m", "2m", "59m", "1h 0m", "1h 5m", "<1m"))
+
+    def test_no_timing_line_before_the_first_tool_call(self):
+        t = m._Turn()
+        self.assertNotIn("⏱", m.StatusMessage.render(t))
+
+    def test_timing_while_thinking_and_while_a_tool_runs(self):
+        now = time.time()
+        t = m._Turn()
+        t.started, t.steps = now - 16 * 60, 21
+        t.last_tools, t.last_tool_at, t.phase_at = ["edit_file — editing MEMORY.md"], now - 130, now - 20
+        text = m.StatusMessage.render(t, now)
+        self.assertTrue(text.endswith("Step 21 · 16m\n⏱ last tool call: 2m ago"), text)       # LLM wait < 1 min: not shown
+        t.phase_at = now - 75
+        self.assertTrue(m.StatusMessage.render(t, now).endswith("⏱ last tool call: 2m ago · waiting for the LLM: 1m"))
+        t.phase, t.names, t.last_tool_at = "tool", ["exec"], now - 3900
+        self.assertTrue(m.StatusMessage.render(t, now).endswith("⏱ tool running: 1h 5m"))
+        t.last_tool_at = now - 5
+        self.assertTrue(m.StatusMessage.render(t, now).endswith("⏱ tool running: <1m"))
+
+    def test_text_changes_only_once_a_minute(self):
+        now = time.time()
+        t = m._Turn()
+        t.started, t.last_tool_at, t.phase, t.names = now - 600, now - 70, "tool", ["exec"]
+        self.assertEqual(m.StatusMessage.render(t, now), m.StatusMessage.render(t, now + 20))      # 70s -> 90s: still "1m"
+
+    def test_live_message_shows_tool_running_then_last_tool_call(self):
+        tg, s = self.make()
+        s.begin()
+        s.tools(["exec"])
+        self.assertTrue(wait_for(lambda: any("⏱ tool running: <1m" in (x or "") for x in tg.texts())))
+        s.begin()
+        self.assertTrue(wait_for(lambda: any("⏱ last tool call: <1m ago" in (x or "") for x in tg.texts())))
+        s.finish()
+
+    def test_stalled_warning_says_how_long_ago_the_last_tool_call_was(self):
+        flag = {"dead": False}
+        tg, s = self.make(stall_after=lambda: flag["dead"])
+        s.begin()
+        s.tools(["exec"])
+        wait_for(lambda: "sendMessage" in tg.methods())
+        flag["dead"] = True
+        self.assertTrue(wait_for(lambda: any("last tool call <1m ago" in (x or "") for x in tg.texts())))
+
+
     def test_telegram_errors_never_raise(self):
         def boom(method, **p):
             raise RuntimeError("network down")

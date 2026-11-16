@@ -1124,6 +1124,8 @@ class _Turn:
         self.started = time.time()
         self.steps = 0
         self.phase = "thinking"       # thinking = waiting for the LLM, tool = tools are running
+        self.phase_at = self.started  # when the current phase began (a new LLM request / a new tool call)
+        self.last_tool_at = 0.0       # when the model last asked for a tool call (0 = none yet)
         self.names = []
         self.last_tools = []
         self.details = []             # one short 'what exactly' phrase per tool in names
@@ -1161,6 +1163,7 @@ class StatusMessage:
             if t is not None and not t.done.is_set():
                 t.finish_at = 0.0
                 t.phase = "thinking"
+                t.phase_at = time.time()
                 return
             t = self._turn = _Turn()
         threading.Thread(target=self._run, args=(t,), daemon=True).start()
@@ -1172,6 +1175,7 @@ class StatusMessage:
                 return
             t.finish_at = 0.0
             t.phase = "tool"
+            t.phase_at = t.last_tool_at = time.time()
             t.names = [short_tool_name(n) for n in names][:3]
             t.details = [_clip(d, 60) for d in (details or [])][:3]
             t.why = why or ""
@@ -1191,8 +1195,30 @@ class StatusMessage:
 
     # -- rendering
     @staticmethod
+    def ago(seconds):
+        """Minute resolution on purpose: the text only changes once a minute, so a 3-hour job does not mean 10 000 edits."""
+        mins = max(int(seconds), 0) // 60
+        if mins < 1:
+            return "<1m"
+        h, m = divmod(mins, 60)
+        return f"{h}h {m}m" if h else f"{m}m"
+
+    @staticmethod
+    def timing(t, now):
+        """How long since the last tool call - tells you at a glance whether the agent is stuck (empty until the first tool call)."""
+        if not t.last_tool_at:
+            return ""
+        if t.phase == "tool":
+            return f"⏱ tool running: {StatusMessage.ago(now - t.last_tool_at)}"
+        out = f"⏱ last tool call: {StatusMessage.ago(now - t.last_tool_at)} ago"
+        if now - t.phase_at >= 60:
+            out += f" · waiting for the LLM: {StatusMessage.ago(now - t.phase_at)}"
+        return out
+
+    @staticmethod
     def render(t, now=None):
-        mins = int(((now or time.time()) - t.started) // 60)
+        now = now or time.time()
+        mins = int((now - t.started) // 60)
         labels = StatusMessage._labels(t)
         if t.phase == "tool" and t.names:
             line = "🔧 " + "\n🔧 ".join(labels)
@@ -1204,7 +1230,9 @@ class StatusMessage:
             line = "🧠 Thinking…"
         h, m = divmod(mins, 60)
         elapsed = f"{h}h {m}m" if h else f"{m}m"
-        return f"⚙️ Agent is working…\n{line}\nStep {t.steps} · {elapsed}"
+        out = f"⚙️ Agent is working…\n{line}\nStep {t.steps} · {elapsed}"
+        timing = StatusMessage.timing(t, now)
+        return out + ("\n" + timing if timing else "")
 
     # -- telegram plumbing (never raises)
     def _api(self, method, **params):
@@ -1250,11 +1278,12 @@ class StatusMessage:
             t.done.set()
             mins = int((time.time() - t.started) // 60)
             last = " + ".join(t.last_tools) or "-"
+            since = self.ago(time.time() - t.last_tool_at) if t.last_tool_at else "-"
             stalled = t.stalled
         for cid, mid in list(t.msg_ids.items()):
             if stalled:
                 self._api("editMessageText", chat_id=cid, message_id=mid, text=(
-                    f"⚠️ Agent कडून बराच वेळ काहीही activity नाही (last: {last}, {mins}m नंतर). "
+                    f"⚠️ Agent कडून बराच वेळ काहीही activity नाही (last: {last}, {mins}m नंतर; last tool call {since} ago). "
                     "काम थांबलं असू शकतं — 'continue' पाठवा."))
             elif self.delete_on_finish:
                 r = self._api("deleteMessage", chat_id=cid, message_id=mid)

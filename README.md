@@ -35,7 +35,13 @@ While a job runs, the proxy keeps ONE message updated, with **what exactly** the
 🔧 exec — installing pandas, openpyxl
 💡 Now I install the libraries to parse the CSV.
 Step 27 · 8m
+⏱ tool running: 3m
 ```
+- `⏱ …` (new): how long since the model's **last tool call**, so you can see at a glance whether the agent is stuck.
+  While a tool runs: `⏱ tool running: 3m`. While it waits for the LLM: `⏱ last tool call: 2m ago` (plus `· waiting for the LLM: 1m`
+  once that wait passes a minute - long LLM waits and long-running commands look different). Minute resolution (`<1m`, `5m`, `1h 5m`), so the
+  message is still edited only once a minute. Nothing is shown before the first tool call. The "no activity" warning also says how long ago
+  the last tool call was.
 - `🔧 tool — what`: built from the tool call's name + arguments by plain parsing (no extra LLM request, no API, no tokens):
   `exec` commands become `running scrape.py`, `installing ...`, `downloading host`, `running tests`, `waiting 30s`, `searching ...`;
   file tools become `reading/writing/editing <file>`; `web_search` shows the query, `web_fetch` the host.
