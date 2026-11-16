@@ -267,3 +267,12 @@ Agent commands: `ramguard status`, `ramguard log`.
 | `RAM_GUARD_NOTIFY` / `RAM_GUARD_MLOCK` | `1` / `1` | Telegram message / lock guard pages in RAM |
 
 A kill is `SIGKILL`: the job cannot save, so the agent is told to continue in small batches.
+
+## Live stats page (`/memory`, JSON at `/api/stats`)
+Shows only **this container's plan allotment** (cgroup: RAM working set without page cache, CPU vs the vCPU quota, disk by `du`), never the host machine.
+It has red alerts (RAM/CPU >= 85 %, CPU throttled, disk >= 90 %, new OOM kills) and two tables (top by RAM, top by CPU).
+
+Low overhead by design: while nobody has the page/API open the server reads ONE cgroup file every 10 s (to keep the 1m/5m/15m averages)
+and nothing else. Opening the page switches to a 2 s sample + process scan; `du` runs at most every 120 s, niced. About 15 s after the last request
+it goes idle again. The page pauses its refresh while the browser tab is hidden. Command lines are shown with passwords/keys/tokens redacted.
+Tune the limits with `RAM_LIMIT_MB`, `CPU_LIMIT`, `DISK_LIMIT_MB` if auto-detection shows the wrong plan size.

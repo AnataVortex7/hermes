@@ -16,6 +16,7 @@ STATS.start()
 
 
 def get_stats():
+    STATS.touch()                      # somebody is looking -> sample fast; idle again ~15 s after the last request
     snap = STATS.snapshot()
     snap["platform"] = _platform()
     snap["startup"] = get_startup_phase()
@@ -176,6 +177,7 @@ footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 12px; 
 .dash-link { display: inline-block; margin-top: 10px; color: #38bdf8; font-size: 13px; text-decoration: none; }
 .dash-link:hover { text-decoration: underline; }
 .warn { color: #f43f5e; font-weight: 700; }
+.alert { background: #3b1418; border: 1px solid #f43f5e; border-radius: 10px; padding: 10px 14px; margin-bottom: 16px; color: #fecdd3; font-size: 14px; line-height: 1.7; }
 </style>
 </head>
 <body>
@@ -187,6 +189,7 @@ footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 12px; 
 
 """ + STARTUP_BANNER + """
 
+  <div id="alerts"></div>
   <div class="grid">
     <div class="card">
       <h2>RAM <span id="mem-pct">0%</span></h2>
@@ -214,14 +217,21 @@ footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 12px; 
       <thead><tr><th>PID</th><th>Command</th><th>RAM (MB)</th><th>RAM %</th><th>CPU % of limit</th></tr></thead>
       <tbody id="proc-table"><tr><td colspan="5" style="text-align:center;color:#64748b;">Loading...</td></tr></tbody>
     </table>
+  </div>
+  <div class="table-card" style="margin-top:16px;">
+    <h2>Top by CPU</h2>
+    <table>
+      <thead><tr><th>PID</th><th>Command</th><th>CPU % of limit</th><th>RAM (MB)</th></tr></thead>
+      <tbody id="cpu-table"><tr><td colspan="4" style="text-align:center;color:#64748b;">Loading...</td></tr></tbody>
+    </table>
     <a class="dash-link" href="/picoclaw" target="_blank">Open PicoClaw →</a>
   </div>
-  <footer id="foot">Auto-refreshing every 3 seconds</footer>
+  <footer id="foot">Auto-refreshing every 2 seconds</footer>
 </div>
 <script>
 function $(id){return document.getElementById(id);}
 function updateStats() {
-  fetch('/api/stats').then(function(r){return r.json();}).then(function(d) {
+  return fetch('/api/stats', {cache: 'no-store'}).then(function(r){return r.json();}).then(function(d) {
     var m=d.memory, k=d.disk, c=d.cpu;
     $('platform').textContent = '(' + d.platform + ')';
     $('limits').textContent = c.limit_cores + ' vCPU / ' + m.total_mb + ' MB RAM / ' + k.total_mb + ' MB disk';
@@ -242,7 +252,7 @@ function updateStats() {
     $('cpu-bar').style.width = c.percent + '%';
     $('cpu-sub').textContent = 'Using ' + c.cores_used + ' vCPU • avg 1m/5m/15m: ' + c.avg['1m'] + '% / ' + c.avg['5m'] + '% / ' + c.avg['15m'] + '% • throttled: ' + c.throttled_percent + '%';
     $('uptime').textContent = d.uptime;
-    $('foot').textContent = 'Auto-refreshing every 3 seconds • RAM/CPU from ' + m.source + ' (limits: ' + m.limit_source + '; ' + c.limit_source + ') • disk limit: ' + k.limit_source;
+    $('foot').textContent = 'Auto-refreshing every 2 seconds (paused while this tab is hidden) • only the container plan allotment, not the host • RAM/CPU from ' + m.source + ' (limits: ' + m.limit_source + '; ' + c.limit_source + ') • disk limit: ' + k.limit_source;
     if (d.startup && d.startup.phase === 'ready') { $('startup-banner').classList.add('hidden'); }
     else if (d.startup) { $('banner-title').textContent = d.startup.message || 'Restoring...'; }
     var tbody = $('proc-table'); tbody.innerHTML = '';
@@ -251,10 +261,26 @@ function updateStats() {
       [p.pid, p.command, p.rss_mb, p.mem + '%', p.cpu + '%'].forEach(function(v){ var td=document.createElement('td'); td.textContent=v; tr.appendChild(td); });
       tbody.appendChild(tr);
     });
+    var ct = $('cpu-table'); ct.innerHTML = '';
+    (d.processes_cpu || []).forEach(function(p) {
+      var tr = document.createElement('tr');
+      [p.pid, p.command, p.cpu + '%', p.rss_mb].forEach(function(v){ var td=document.createElement('td'); td.textContent=v; tr.appendChild(td); });
+      ct.appendChild(tr);
+    });
+    var al = $('alerts'); al.innerHTML = '';
+    if (d.alerts && d.alerts.length) {
+      var box = document.createElement('div'); box.className = 'alert';
+      d.alerts.forEach(function(a, i){ if (i) box.appendChild(document.createElement('br')); box.appendChild(document.createTextNode('\u26a0 ' + a)); });
+      al.appendChild(box);
+    }
+    document.title = (d.alerts && d.alerts.length ? '\u26a0 ' : '') + 'Hermes Live Stats';
   }).catch(function(err) { console.error('Stats fetch error:', err); });
 }
-setInterval(updateStats, 3000);
-updateStats();
+function loop() {
+  if (document.hidden) { setTimeout(loop, 2000); return; }      // hidden tab: no requests -> server goes idle
+  updateStats().then(function(){ setTimeout(loop, 2000); }, function(){ setTimeout(loop, 2000); });
+}
+loop();
 </script>
 </body>
 </html>

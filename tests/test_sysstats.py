@@ -119,6 +119,86 @@ class SysStatsTests(unittest.TestCase):
         d = s.disk()
         self.assertEqual((d["total_mb"], d["used_mb"], d["free_mb"], d["percent"]), (1000.0, 250.0, 750.0, 25.0))
 
+    # ---- low-overhead sampling + alerts ----
+    def test_idle_tick_only_reads_cpu_counter_and_does_no_scans(self):
+        w(self.cg, "cpu.stat", "usage_usec 0\nthrottled_usec 0\n")
+        s = self.stats()
+        calls = []
+        s.scan_processes = lambda *a, **k: calls.append("procs")
+        s.scan_disk = lambda *a, **k: calls.append("disk")
+        self.assertFalse(s.active())
+        self.assertEqual(s.tick(), 10.0)                      # IDLE_INTERVAL
+        self.assertEqual(calls, [])                           # nobody watching: no process scan, no du
+        self.assertEqual(len(s._samples), 1)                  # but the cheap cpu sample is taken
+
+    def test_touch_switches_to_fast_mode_then_back_to_idle(self):
+        w(self.cg, "cpu.stat", "usage_usec 0\nthrottled_usec 0\n")
+        s = self.stats()
+        calls = []
+        s.scan_processes = lambda *a, **k: calls.append("procs")
+        s.scan_disk = lambda *a, **k: (calls.append("disk"), s._disk.update(at=s.clock()))
+        s.touch()
+        self.assertTrue(s._wake.is_set())                     # first view wakes the sampler immediately
+        self.assertEqual(s.tick(), 2.0)                       # FAST_INTERVAL
+        self.assertEqual(calls, ["procs", "disk"])            # disk never measured yet -> measured once
+        self.clock.t += 5
+        s.touch(); s._wake.clear()
+        s.touch()
+        self.assertFalse(s._wake.is_set())                    # already active: more requests do not re-wake it
+        s.tick()
+        self.assertEqual(calls, ["procs", "disk", "procs"])   # du is NOT repeated before DISK_EVERY
+        self.clock.t += 16                                    # nobody asked for 16 s
+        self.assertFalse(s.active())
+        self.assertEqual(s.tick(), 10.0)
+
+    def test_alerts_for_high_ram_cpu_disk_and_new_oom_kills(self):
+        w(self.cg, "memory.current", str(480 * 1048576))
+        w(self.cg, "memory.max", str(512 * 1048576))
+        w(self.cg, "memory.stat", "inactive_file 0\n")
+        w(self.cg, "memory.events", "oom_kill 0\n")
+        w(self.cg, "cpu.max", "10000 100000")
+        s = self.stats(DISK_LIMIT_MB="1000")
+        s._disk = {"used_mb": 950.0, "parts": {}, "at": 0}
+        w(self.cg, "cpu.stat", "usage_usec 0\nthrottled_usec 0\n")
+        s.sample()
+        self.clock.t += 10
+        w(self.cg, "cpu.stat", f"usage_usec {int(0.95e6)}\nthrottled_usec 0\n")    # 0.095 vCPU of 0.1
+        s.sample()
+        a = s.snapshot()["alerts"]
+        self.assertTrue(any(x.startswith("RAM high") for x in a), a)
+        self.assertTrue(any(x.startswith("CPU high") for x in a), a)
+        self.assertTrue(any(x.startswith("Disk almost full") for x in a), a)
+        self.assertFalse(any("OOM" in x for x in a), a)       # baseline value, nothing new yet
+        w(self.cg, "memory.events", "oom_kill 2\n")
+        self.assertTrue(any("OOM kill detected (+2" in x for x in s.snapshot()["alerts"]))
+
+    def test_no_alerts_when_everything_is_calm(self):
+        w(self.cg, "memory.current", str(100 * 1048576))
+        w(self.cg, "memory.max", str(512 * 1048576))
+        w(self.cg, "memory.stat", "inactive_file 0\n")
+        s = self.stats()
+        self.assertEqual(s.snapshot()["alerts"], [])
+
+    def test_top_cpu_list_is_sorted_by_cpu_and_secrets_are_redacted(self):
+        w(self.cg, "memory.current", "1")
+        w(self.cg, "cpu.max", "10000 100000")
+        for pid, rss_mb, name in ((5, 100, "idle-big"), (6, 10, "busy-small")):
+            w(self.proc, f"{pid}/statm", f"1 {rss_mb * 1048576 // 4096} 0 0 0 0 0")
+            w(self.proc, f"{pid}/comm", name)
+            w(self.proc, f"{pid}/cmdline", f"/usr/bin/{name}\x00")
+            w(self.proc, f"{pid}/stat", f"{pid} ({name}) S " + " ".join(["0"] * 10 + ["0", "0"] + ["0"] * 30))
+        s = self.stats()
+        s.scan_processes()
+        self.clock.t += 10
+        w(self.proc, "6/stat", "6 (busy-small) S " + " ".join(["0"] * 10 + [str(s.clk_tck // 2), str(s.clk_tck // 2)] + ["0"] * 30))
+        s.scan_processes()
+        snap = s.snapshot()
+        self.assertEqual([r["command"] for r in snap["processes"]], ["idle-big", "busy-small"])        # by RAM
+        self.assertEqual([r["command"] for r in snap["processes_cpu"]], ["busy-small", "idle-big"])    # by CPU
+        from sysstats import _redact
+        self.assertEqual(_redact("tailscale up --authkey=tskey-abc123 x"), "tailscale up --authkey=*** x")
+        self.assertNotIn("hunter2", _redact("run --password hunter2"))
+
 
 if __name__ == "__main__":
     unittest.main()
