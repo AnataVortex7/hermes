@@ -443,6 +443,10 @@ class PingHandler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    try:    # file-manager API for the tgstorage "Machines" page: 127.0.0.1 only, reaches the tailnet via tailscale serve (see start.sh)
+        import fsd; fsd.start()
+    except Exception as e:
+        print(f"fsd: not started: {e}", flush=True)
     port = int(os.environ.get("PORT", 10000))
     # Threaded: a slow request (UI proxy, many pollers) must never block the platform's health check on "/".
     http.server.ThreadingHTTPServer.daemon_threads = True

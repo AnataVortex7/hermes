@@ -39,6 +39,7 @@ COPY --from=tailscale /usr/local/bin/tailscale /usr/local/bin/tailscale
 WORKDIR /app
 
 COPY keep_alive.py /app/keep_alive.py
+COPY fsd.py /app/fsd.py
 COPY sysstats.py /app/sysstats.py
 COPY ram_guard.py /app/ram_guard.py
 COPY start.sh /app/start.sh

@@ -282,3 +282,8 @@ Low overhead by design: while nobody has the page/API open the server reads ONE 
 and nothing else. Opening the page switches to a 2 s sample + process scan; `du` runs at most every 120 s, niced. About 15 s after the last request
 it goes idle again. The page pauses its refresh while the browser tab is hidden. Command lines are shown with passwords/keys/tokens redacted.
 Tune the limits with `RAM_LIMIT_MB`, `CPU_LIMIT`, `DISK_LIMIT_MB` if auto-detection shows the wrong plan size.
+
+## File manager API (for the tgstorage "Machines" page)
+`fsd.py` runs inside `keep_alive.py` as one idle thread (no extra process), listens on `127.0.0.1:8765` and is published to your tailnet only
+(`tailscale serve`, via `TAILSCALE_PORTS`). No password - the tailnet is the boundary. Whole machine by default (`FS_ROOT=/`); `FS_ROOT` confines it,
+`FS_ENABLED=0` turns it off, `FS_PORT` changes the port. The tgstorage website discovers this machine automatically (it shows up as `hermes`).
