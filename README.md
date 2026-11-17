@@ -124,6 +124,25 @@ bottleneck for many small files). Env overrides: `RESTORE_TRANSFERS`, `RESTORE_C
 If the container runs out of RAM during restore lower `RESTORE_TRANSFERS` (e.g. 4). If the log shows `rateLimitExceeded`, lower it
 or set `RESTORE_EXTRA_FLAGS="--tpslimit 8"`.
 
+**How to check you use your own Google client:** the boot log prints one of
+`[rclone] own Google client_id + client_secret found -> fast Drive mode ON` or
+`[rclone] NO own client_id ... shared Google client (slow)`. In `rclone.conf` the `[gdrive]` section must contain
+`client_id = ....apps.googleusercontent.com` and `client_secret = ...` (a token alone is not enough). To create them:
+Google Cloud Console -> new project -> enable "Google Drive API" -> OAuth consent screen -> Credentials -> OAuth client ID
+(type "Desktop app"), then run `rclone config` on your PC with that id/secret, and put the new `rclone.conf` into
+`RCLONE_CONFIG_BASE64` (`base64 -w0 rclone.conf`). Set the consent screen to "In production", otherwise the token expires after 7 days.
+
+### Python packages are stored as ONE archive (much faster restore)
+`~/.picow_clow/pyuser` (everything installed with `pip`) is thousands of tiny files; Google Drive copies roughly 1 small file per
+second, so restoring them one by one can take hours. They are now packed into `archives/pyuser.tar.gz` on Drive and the folder
+itself is excluded from the file-by-file sync; at boot the archive is downloaded (1 file) and unpacked locally in seconds.
+- The archive is (re)built by the periodic 5-minute sync only when packages changed (low priority, in the background).
+  The initial and the shutdown sync never repack, so they stay fast; packages installed in the last <5 min before a shutdown
+  are covered by `installed/pip.list` (pip wrapper) or are picked up by the next periodic sync.
+- Migration: while no archive exists on Drive the old file-by-file restore is used (one time, slow). After the first
+  periodic sync the archive exists and every later restore is fast.
+- Side effect: packages with a folder named `cache`/`runtime` are no longer damaged (the sync excludes those names anywhere).
+
 ## Restart / restore notifications
 On every boot `start.sh` messages every numeric id in `TELEGRAM_ALLOW_FROM` (you must have pressed
 /start on the bot once):

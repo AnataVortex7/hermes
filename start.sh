@@ -141,10 +141,61 @@ picoclaw_sync() {
   rclone "$@" "${PICOCLAW_EXCLUDES[@]}"
 }
 
+# Python packages (~/.picow_clow/pyuser) are thousands of tiny files. Google Drive handles ~1 small file per second,
+# so restoring them one by one takes hours. They are therefore stored on Drive as ONE archive
+# (archives/pyuser.tar.gz) and the pyuser/ folder itself is excluded from the file-by-file sync.
+ARCHIVE_DIR=~/.picow_clow/archives
+PYUSER_ARCHIVE="$ARCHIVE_DIR/pyuser.tar.gz"
+USE_PYUSER_ARCHIVE=0
+
+pyuser_fingerprint() {  # changes when a package file is added / removed / modified (names, sizes, mtimes in seconds)
+  find "$PYTHONUSERBASE" -type f -not -path '*/__pycache__/*' -printf '%P %s %Ts\n' 2>/dev/null | sort | md5sum | cut -d' ' -f1
+}
+
+# pack_pyuser <full|quick>: returns 0 when a usable archive exists (so pyuser/ can be excluded from the file sync).
+#   full  = repack first when packages changed (periodic sync; low priority, runs in the background)
+#   quick = never repack (initial + shutdown sync must be fast); the last archive stays valid
+pack_pyuser() {
+  local mode="${1:-full}" fp tmp
+  if [ "$mode" = "quick" ]; then
+    [ -f "$PYUSER_ARCHIVE" ] && return 0
+    return 1
+  fi
+  [ -d "$PYTHONUSERBASE" ] && [ -n "$(find "$PYTHONUSERBASE" -type f -print -quit 2>/dev/null)" ] || return 1
+  fp=$(pyuser_fingerprint)
+  if [ -f "$PYUSER_ARCHIVE" ] && [ "$(cat "$ARCHIVE_DIR/pyuser.fp" 2>/dev/null)" = "$fp" ]; then
+    return 0
+  fi
+  mkdir -p "$ARCHIVE_DIR"
+  tmp="$PYUSER_ARCHIVE.tmp"
+  echo ">> Packing Python packages into one archive..."
+  if nice -n 19 tar -C ~/.picow_clow --exclude='__pycache__' -I 'gzip -1' -cf "$tmp" pyuser 2>/dev/null; then
+    mv -f "$tmp" "$PYUSER_ARCHIVE" && echo "$fp" > "$ARCHIVE_DIR/pyuser.fp"
+    echo ">> Python packages archive: $(du -h "$PYUSER_ARCHIVE" | cut -f1)"
+    return 0
+  fi
+  rm -f "$tmp"
+  echo ">> Packing Python packages failed - they stay in the file-by-file sync"
+  return 1
+}
+
+unpack_pyuser() {  # after a successful restore that used the archive
+  [ "$USE_PYUSER_ARCHIVE" = "1" ] && [ -f "$PYUSER_ARCHIVE" ] || return 0
+  echo ">> Unpacking Python packages archive..."
+  progress_stage unpacking "Unpacking saved Python packages..."
+  rm -rf "$PYTHONUSERBASE"
+  if tar -C ~/.picow_clow -I 'gzip -d' -xf "$PYUSER_ARCHIVE"; then
+    echo ">> Python packages unpacked."
+  else
+    echo ">> Unpacking Python packages FAILED - they will be re-installed from pip.list if recorded there"
+    rm -rf "$PYTHONUSERBASE"
+  fi
+}
+
 # Live restore progress for the /memory dashboard (percent, MB, speed, time left). See restore_progress.py.
 progress_stage() {  # progress_stage <stage> <message> [--clean-start]
   [ -f /app/restore_progress.py ] || return 0
-  python3 /app/restore_progress.py --stage "$1" --message "$2" $3 >/dev/null 2>&1 || true
+  python3 /app/restore_progress.py --stage "$1" --message "$2" ${3:-} >/dev/null 2>&1 || true
 }
 
 # Restore speed. rclone defaults (4 transfers, 8 checkers, Drive pacer 100ms = ~10 requests/s) are very slow for a backup made
@@ -154,18 +205,34 @@ progress_stage() {  # progress_stage <stage> <message> [--clean-start]
 RESTORE_SPEED=(--transfers "${RESTORE_TRANSFERS:-8}" --checkers "${RESTORE_CHECKERS:-16}")
 if grep -qE '^[[:space:]]*client_id[[:space:]]*=[[:space:]]*[^[:space:]]' ~/.config/rclone/rclone.conf 2>/dev/null; then
   RESTORE_SPEED+=(--drive-pacer-min-sleep 10ms --drive-pacer-burst 200)
+  _SECRET=$(grep -cE '^[[:space:]]*client_secret[[:space:]]*=[[:space:]]*[^[:space:]]' ~/.config/rclone/rclone.conf 2>/dev/null)
+  if [ "${_SECRET:-0}" -gt 0 ]; then
+    echo ">> [rclone] own Google client_id + client_secret found -> fast Drive mode ON"
+  else
+    echo ">> [rclone] client_id found but client_secret is MISSING -> add client_secret too (fast mode may fail)"
+  fi
+elif [ -f ~/.config/rclone/rclone.conf ]; then
+  echo ">> [rclone] NO own client_id in the rclone config -> using rclone's shared Google client (slow, ~1 small file/s). See README 'Restore speed'."
 fi
 # shellcheck disable=SC2206
 [ -n "${RESTORE_EXTRA_FLAGS:-}" ] && RESTORE_SPEED+=(${RESTORE_EXTRA_FLAGS})
 
 # One restore attempt: both rclone syncs, with live progress. Falls back to the plain commands if the helper is missing.
 do_restore() {
+  local px=()
+  USE_PYUSER_ARCHIVE=0
+  if rclone lsf "$REMOTE_BACKUP/archives" --files-only 2>/dev/null | grep -qx 'pyuser.tar.gz'; then
+    px=(--exclude "pyuser/**"); USE_PYUSER_ARCHIVE=1
+    echo ">> Python packages come from one archive (fast path)"
+  else
+    echo ">> No packages archive on Drive yet - restoring pyuser/ file by file (slow, one time; an archive is made after the first periodic sync)"
+  fi
   if [ -f /app/restore_progress.py ]; then
     python3 /app/restore_progress.py --attempt "$ATTEMPT" --attempts "${RESTORE_MAX_ATTEMPTS:-2}" -- \
-      "History and settings" rclone sync "$REMOTE_BACKUP" ~/.picow_clow/ "${RCLONE_EXCLUDES[@]}" --exclude "picoclaw/**" --drive-chunk-size 8M "${RESTORE_SPEED[@]}" \
+      "History and settings" rclone sync "$REMOTE_BACKUP" ~/.picow_clow/ "${RCLONE_EXCLUDES[@]}" --exclude "picoclaw/**" "${px[@]}" --drive-chunk-size 8M "${RESTORE_SPEED[@]}" \
       +++ "PicoClaw data" rclone sync "$PICOCLAW_REMOTE" ~/.picoclaw/ "${PICOCLAW_EXCLUDES[@]}" --drive-chunk-size 8M "${RESTORE_SPEED[@]}"
   else
-    rclone_sync sync "$REMOTE_BACKUP" ~/.picow_clow/ --drive-chunk-size 8M --exclude "picoclaw/**" "${RESTORE_SPEED[@]}" \
+    rclone_sync sync "$REMOTE_BACKUP" ~/.picow_clow/ --drive-chunk-size 8M --exclude "picoclaw/**" "${px[@]}" "${RESTORE_SPEED[@]}" \
       && picoclaw_sync sync "$PICOCLAW_REMOTE" ~/.picoclaw/ --drive-chunk-size 8M "${RESTORE_SPEED[@]}"
   fi
 }
@@ -230,6 +297,7 @@ else
   notify "⚠️ rclone config नाही, म्हणून Drive restore झालं नाही (fresh state). RCLONE_CONFIG_BASE64 तपासा."
 fi
 
+[ "$RESTORE_OK" = "1" ] && unpack_pyuser
 mkdir -p "$PYTHONUSERBASE"
 
 # 3b. Replay packages installed earlier via the bin/ wrappers (apt/pip/npm)
@@ -247,21 +315,23 @@ echo ">> Signaling startup complete..."
 curl -s "http://localhost:${PORT:-10000}/startup-ready" || true
 
 # 4. Background Sync Loop
-sync_to_cloud() {
+sync_to_cloud() {  # sync_to_cloud <full|quick>
   if [ -f ~/.config/rclone/rclone.conf ] && [ "$SYNC_SAFE" = "1" ]; then
+    local px=()
+    pack_pyuser "${1:-full}" && px=(--exclude "pyuser/**")
     rclone mkdir "$REMOTE_BACKUP" 2>/dev/null || true
-    rclone_sync sync ~/.picow_clow/ "$REMOTE_BACKUP" --drive-chunk-size 8M --fast-list --exclude "picoclaw/**" || true
+    rclone_sync sync ~/.picow_clow/ "$REMOTE_BACKUP" --drive-chunk-size 8M --fast-list --exclude "picoclaw/**" "${px[@]}" || true
     picoclaw_sync sync ~/.picoclaw/ "$PICOCLAW_REMOTE" --drive-chunk-size 8M --fast-list || true
   fi
 }
 
 echo ">> Initial sync to Drive..."
-sync_to_cloud
+sync_to_cloud quick
 
 (
   while true; do
     sleep 300
-    sync_to_cloud
+    sync_to_cloud full
   done
 ) &
 SYNC_PID=$!
@@ -276,7 +346,7 @@ cleanup() {
   [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null || true
   [ -n "$APP_PID" ] && kill "$APP_PID" 2>/dev/null || true
   kill $SYNC_PID 2>/dev/null || true
-  sync_to_cloud
+  sync_to_cloud quick
   exit 0
 }
 trap cleanup SIGTERM SIGINT EXIT
