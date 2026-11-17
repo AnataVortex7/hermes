@@ -4,7 +4,7 @@ export TZ="Asia/Kolkata"
 
 echo "=== [PicoW Clow Koyeb Instant Startup & Background Sync] ==="
 
-rm -f /tmp/shutting_down /tmp/restore_progress.json /tmp/restore.log /tmp/setup_picoclaw.log /tmp/picoclaw.log /tmp/stream_proxy.log
+rm -f /tmp/shutting_down /tmp/restore_progress.json /tmp/restore.log /tmp/setup_picoclaw.log /tmp/picoclaw.log /tmp/stream_proxy.log /tmp/backup_now /tmp/backup_status.json
 
 # 1. START KEEP-ALIVE SERVER INSTANTLY
 if [ -f /app/keep_alive.py ]; then
@@ -315,13 +315,33 @@ echo ">> Signaling startup complete..."
 curl -s "http://localhost:${PORT:-10000}/startup-ready" || true
 
 # 4. Background Sync Loop
+# Every run is recorded by backup_status.py (start / result / duration / error): the /memory dashboard shows
+# "last backup ... ago", a failing backup raises a red alert, and its "Backup now" button creates $BACKUP_TRIGGER.
+BACKUP_INTERVAL="${BACKUP_INTERVAL:-300}"
+BACKUP_TRIGGER="${BACKUP_TRIGGER_FILE:-/tmp/backup_now}"
+bstatus() { python3 /app/backup_status.py "$@" >/dev/null 2>&1 || true; }
+
 sync_to_cloud() {  # sync_to_cloud <full|quick>
   if [ -f ~/.config/rclone/rclone.conf ] && [ "$SYNC_SAFE" = "1" ]; then
-    local px=()
+    local px=() t0 rc1=0 rc2=0 e1=/tmp/backup_err1.log e2=/tmp/backup_err2.log err
+    t0=$(date +%s)
+    bstatus start "${1:-full}"
     pack_pyuser "${1:-full}" && px=(--exclude "pyuser/**")
     rclone mkdir "$REMOTE_BACKUP" 2>/dev/null || true
-    rclone_sync sync ~/.picow_clow/ "$REMOTE_BACKUP" --drive-chunk-size 8M --fast-list --exclude "picoclaw/**" "${px[@]}" || true
-    picoclaw_sync sync ~/.picoclaw/ "$PICOCLAW_REMOTE" --drive-chunk-size 8M --fast-list || true
+    # stderr goes to a file first so the exit code is not lost (it used to be swallowed by `|| true`), then to the log
+    rclone_sync sync ~/.picow_clow/ "$REMOTE_BACKUP" --drive-chunk-size 8M --fast-list --exclude "picoclaw/**" "${px[@]}" 2>"$e1" || rc1=$?
+    cat "$e1" >&2
+    picoclaw_sync sync ~/.picoclaw/ "$PICOCLAW_REMOTE" --drive-chunk-size 8M --fast-list 2>"$e2" || rc2=$?
+    cat "$e2" >&2
+    if [ "$rc1" = "0" ] && [ "$rc2" = "0" ]; then
+      bstatus done "${1:-full}" ok $(( $(date +%s) - t0 ))
+    else
+      err=$(cat "$e1" "$e2" 2>/dev/null | grep -a -E 'ERROR|Failed|Fatal' | tail -n 3 | cut -c1-300 | tr '\n' ' ')
+      echo ">> [backup] FAILED (rclone exit codes: history=$rc1 picoclaw=$rc2) $err"
+      bstatus done "${1:-full}" fail $(( $(date +%s) - t0 )) "rclone exit $rc1/$rc2: $err"
+    fi
+  else
+    bstatus disabled "the Drive restore did not finish, so syncing is switched off to protect the existing backup"
   fi
 }
 
@@ -330,7 +350,13 @@ sync_to_cloud quick
 
 (
   while true; do
-    sleep 300
+    # wait BACKUP_INTERVAL seconds, but start at once when the dashboard's "Backup now" button created the trigger file
+    waited=0
+    while [ "$waited" -lt "$BACKUP_INTERVAL" ] && [ ! -f "$BACKUP_TRIGGER" ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    rm -f "$BACKUP_TRIGGER"
     sync_to_cloud full
   done
 ) &
@@ -346,6 +372,7 @@ cleanup() {
   [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null || true
   [ -n "$APP_PID" ] && kill "$APP_PID" 2>/dev/null || true
   kill $SYNC_PID 2>/dev/null || true
+  pkill -TERM -P "$SYNC_PID" 2>/dev/null || true     # an rclone from the loop would otherwise race the final sync
   sync_to_cloud quick
   exit 0
 }

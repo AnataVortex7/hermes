@@ -11,6 +11,7 @@ import urllib.request
 
 from sysstats import Stats
 import restore_progress
+import backup_status
 
 # ── Accurate container stats (cgroup based, see sysstats.py) ──
 STATS = Stats()
@@ -22,6 +23,9 @@ def get_stats():
     snap = STATS.snapshot()
     snap["platform"] = _platform()
     snap["startup"] = get_startup_phase()
+    snap["backup"] = backup_status.summary()
+    if snap["backup"]["alert"]:                  # a failing / stale Drive backup must be visible without opening logs
+        snap["alerts"] = list(snap.get("alerts") or []) + [snap["backup"]["alert"]]
     return snap
 
 
@@ -231,6 +235,13 @@ footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 12px; 
 .dash-link { display: inline-block; margin-top: 10px; color: #38bdf8; font-size: 13px; text-decoration: none; }
 .dash-link:hover { text-decoration: underline; }
 .warn { color: #f43f5e; font-weight: 700; }
+.btn { margin-top: 12px; background: #0ea5e9; color: #0b1220; border: 0; border-radius: 8px; padding: 9px 16px; font-size: 14px; font-weight: 700; cursor: pointer; }
+.btn:hover { background: #38bdf8; }
+.btn:disabled { background: #334155; color: #94a3b8; cursor: not-allowed; }
+.bk-dots { margin-top: 8px; font-size: 14px; letter-spacing: 2px; min-height: 18px; }
+.bk-ok { color: #34d399; }
+.bk-bad { color: #f43f5e; }
+.bk-err { color: #fecdd3; font-size: 12px; margin-top: 6px; word-break: break-word; }
 .alert { background: #3b1418; border: 1px solid #f43f5e; border-radius: 10px; padding: 10px 14px; margin-bottom: 16px; color: #fecdd3; font-size: 14px; line-height: 1.7; }
 </style>
 </head>
@@ -262,6 +273,15 @@ footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 12px; 
       <div class="value" id="cpu-val">...</div>
       <div class="subtext" id="cpu-sub"></div>
       <div class="progress-bar"><div class="progress-fill" id="cpu-bar" style="width:0%;background-color:#f43f5e"></div></div>
+    </div>
+    <div class="card" id="bk-card">
+      <h2>Drive backup <span id="bk-state"></span></h2>
+      <div class="value" id="bk-val">...</div>
+      <div class="subtext" id="bk-sub"></div>
+      <div class="bk-dots" id="bk-dots" title="last backups (newest on the right)"></div>
+      <div class="bk-err" id="bk-err"></div>
+      <button class="btn" id="bk-btn" type="button">&#9729; Backup now</button>
+      <div class="subtext" id="bk-msg"></div>
     </div>
   </div>
   <div class="table-card">
@@ -347,6 +367,58 @@ function renderStartup(st) {
   $('banner-files').textContent = (showGrid ? 'Files: ' + (r.files_done || 0) + ' / ' + (r.files_total || 0) + ' | elapsed ' + fmtDur(r.elapsed_seconds) : '') + (cur && showGrid ? ' | now: ' + cur : '');
   $('banner-err').textContent = (cls === 'bad' && r.error) ? r.error : '';
 }
+function fmtAgo(s) {
+  if (s === null || s === undefined) return 'never';
+  s = Math.round(Number(s) || 0);
+  if (s < 5) return 'just now';
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+function renderBackup(b) {
+  if (!b) return;
+  var val = '...', st = '', cls = '';
+  if (b.state === 'running') { val = '\u23f3 Backup running... ' + fmtDur(b.running_s); st = 'running'; }
+  else if (b.state === 'disabled') { val = '\u23f8 OFF'; st = 'disabled'; cls = 'bk-bad'; }
+  else if (b.state === 'failed') { val = '\u274c Failed ' + fmtAgo(b.last_fail_ago_s); st = 'failed'; cls = 'bk-bad'; }
+  else if (b.state === 'ok') { val = '\u2705 ' + fmtAgo(b.last_ok_ago_s); st = 'ok'; cls = b.overdue ? 'bk-bad' : 'bk-ok'; }
+  else { val = '\u23f3 waiting for the first backup'; st = ''; }
+  $('bk-val').textContent = val;
+  $('bk-val').className = 'value ' + cls;
+  $('bk-state').textContent = st;
+  var sub = [];
+  if (b.state === 'failed' && b.last_ok_ago_s !== null) sub.push('last good backup: ' + fmtAgo(b.last_ok_ago_s));
+  if (b.state === 'disabled') sub.push(b.disabled_reason || 'sync is off for this run');
+  else {
+    if (b.last_duration_s !== null && b.last_duration_s !== undefined && b.state !== 'running') sub.push('took ' + fmtDur(b.last_duration_s));
+    sub.push('auto every ' + Math.round(b.interval_s / 60) + ' min');
+    sub.push(b.ok_count + ' ok / ' + b.fail_count + ' failed since boot');
+  }
+  if (b.pending) sub.push('manual backup queued');
+  $('bk-sub').textContent = sub.join(' \u2022 ');
+  var dots = $('bk-dots'); dots.innerHTML = '';
+  (b.history || []).forEach(function(h) {
+    var sp = document.createElement('span');
+    sp.className = h.ok ? 'bk-ok' : 'bk-bad';
+    sp.textContent = h.ok ? '\u25cf' : '\u2716';
+    sp.title = (h.ok ? 'ok' : 'FAILED') + ' - ' + fmtAgo(h.ago_s) + ' - ' + fmtDur(h.secs);
+    dots.appendChild(sp);
+  });
+  $('bk-err').textContent = (b.state === 'failed' && b.last_error) ? b.last_error : '';
+  $('bk-btn').disabled = (b.state === 'running' || b.pending);
+}
+function requestBackup() {
+  var btn = $('bk-btn'); btn.disabled = true; $('bk-msg').textContent = 'Requesting...';
+  fetch('/api/backup-now', {method: 'POST', cache: 'no-store'}).then(function(r) {
+    return r.json().catch(function(){ return {}; }).then(function(j){ return {status: r.status, j: j}; });
+  }).then(function(x) {
+    var m = {queued: 'Backup requested - it starts within a second.', already_queued: 'A backup is already queued.',
+             running: 'A backup is already running.', error: 'Could not request a backup.'};
+    $('bk-msg').textContent = x.status === 401 ? 'Login required.' : (m[x.j.result] || ('Error ' + x.status));
+    updateStats();
+  }).catch(function() { $('bk-msg').textContent = 'Request failed.'; btn.disabled = false; });
+}
 function updateStats() {
   return fetch('/api/stats', {cache: 'no-store'}).then(function(r){return r.json();}).then(function(d) {
     var m=d.memory, k=d.disk, c=d.cpu;
@@ -371,6 +443,7 @@ function updateStats() {
     $('uptime').textContent = d.uptime;
     $('foot').textContent = 'Auto-refreshing every 2 seconds (paused while this tab is hidden) • only the container plan allotment, not the host • RAM/CPU from ' + m.source + ' (limits: ' + m.limit_source + '; ' + c.limit_source + ') • disk limit: ' + k.limit_source;
     renderStartup(d.startup);
+    renderBackup(d.backup);
     var tbody = $('proc-table'); tbody.innerHTML = '';
     d.processes.forEach(function(p) {
       var tr = document.createElement('tr');
@@ -398,6 +471,7 @@ function loop() {
   if (document.hidden) { setTimeout(loop, 2000); return; }      // hidden tab: no requests -> server goes idle
   updateStats().then(function(){ setTimeout(loop, 2000); }, function(){ setTimeout(loop, 2000); });
 }
+$('bk-btn').addEventListener('click', requestBackup);
 loop();
 </script>
 </body>
@@ -545,6 +619,13 @@ class PingHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        if self.path.split("?", 1)[0] == "/api/backup-now":
+            if not self._authorized():          # UI_BASIC_AUTH (when set) protects the button too
+                return
+            res = backup_status.request_now()
+            self._send(200 if res != "error" else 500, "application/json", json.dumps({"result": res}),
+                       {"Cache-Control": "no-store"})
+            return
         self._write_method("POST")
 
     def do_PUT(self):

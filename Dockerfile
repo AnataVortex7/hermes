@@ -42,6 +42,7 @@ COPY keep_alive.py /app/keep_alive.py
 COPY fsd.py /app/fsd.py
 COPY sysstats.py /app/sysstats.py
 COPY restore_progress.py /app/restore_progress.py
+COPY backup_status.py /app/backup_status.py
 COPY ram_guard.py /app/ram_guard.py
 COPY start.sh /app/start.sh
 COPY setup_picoclaw.py /app/setup_picoclaw.py

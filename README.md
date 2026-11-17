@@ -107,6 +107,16 @@ On every boot a marked block is (re)written into `workspace/USER.md` telling the
 permissions, so stale "cron is restricted" notes in its memory stop making it refuse.
 Python packages persist via `PYTHONUSERBASE=~/.picow_clow/pyuser` (synced to Drive).
 
+## Drive backup status + "Backup now" button (`/memory`)
+The periodic Drive sync (every `BACKUP_INTERVAL` seconds, default 300) used to hide failures (`|| true`). Now every run is
+recorded by `backup_status.py` (`/tmp/backup_status.json`) and the **Drive backup** card on `/memory` shows:
+**last backup "X ago"** (green = ok, red = failed / overdue), how long it took, ok/failed counts since boot, a row of the last
+10 results, and the last rclone error. A red alert appears at the top after 2 failures in a row, when no backup succeeded for
+3 intervals, when one has been running > 1 h, or when sync is switched off (restore failed).
+**Backup now** (`POST /api/backup-now`) starts a backup within a second (it creates `/tmp/backup_now`, which the sync loop
+watches). It is protected by `UI_BASIC_AUTH` when that is set; a second click while one is queued/running does nothing.
+On shutdown the loop's running rclone is stopped before the final sync, so the two can no longer race.
+
 ## Live restore progress on the dashboard (`/memory`)
 While the Drive restore runs, the top of the `/memory` page shows a progress card: **percent, MB restored / total,
 MB remaining, speed, time left (ETA), files done / total** and the file being copied. `start.sh` runs the restore through
