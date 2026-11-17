@@ -2,6 +2,7 @@ import base64, http.server, json, os, socket, sys, threading, time, unittest, ur
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import keep_alive  # noqa: E402
+import restore_progress  # noqa: E402
 
 
 def free_port():
@@ -133,6 +134,76 @@ class KeepAliveTests(unittest.TestCase):
         self.assertEqual(self.get("/")[0], 200)
         self.assertLess(time.time() - t0, 0.6)                                # threaded server: answered while /slow sleeps
         t.join()
+
+    # ── live restore progress on the dashboard ──
+    def _use_temp_state(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        old = restore_progress.STATE_FILE
+        restore_progress.STATE_FILE = os.path.join(d, "state.json")
+        self.addCleanup(setattr, restore_progress, "STATE_FILE", old)
+        with keep_alive._startup_lock:
+            saved = dict(keep_alive._startup_state)
+        self.addCleanup(keep_alive._startup_state.update, saved)
+        keep_alive._startup_state.update({"phase": "waiting", "message": "Restoring state from Google Drive..."})
+
+    def test_api_stats_exposes_live_restore_progress(self):
+        self._use_temp_state()
+        restore_progress.write_state({"stage": "restoring", "message": "m", "percent": 42.5, "bytes_done": 5, "bytes_total": 10,
+                                      "eta_seconds": 30, "speed_bps": 1000, "phase": 1, "phases": 2, "label": "x"})
+        _, body, _ = self.get("/api/stats")
+        st = json.loads(body)["startup"]
+        self.assertEqual(st["phase"], "waiting")
+        self.assertEqual(st["restore"]["percent"], 42.5)
+        self.assertEqual(st["restore"]["eta_seconds"], 30)
+        self.assertFalse(st["restore"]["stalled"])
+        self.assertFalse(st["clean_start"])
+
+    def test_stalled_restore_is_flagged(self):
+        self._use_temp_state()
+        restore_progress.write_state({"stage": "restoring", "percent": 10})
+        st = json.load(open(restore_progress.STATE_FILE))
+        st["updated"] = time.time() - 120
+        json.dump(st, open(restore_progress.STATE_FILE, "w"))
+        r = keep_alive.get_startup_phase()["restore"]
+        self.assertTrue(r["stalled"])
+        self.assertGreaterEqual(r["age_seconds"], 119)
+
+    def test_startup_ready_hides_banner_and_survives_a_restart(self):
+        self._use_temp_state()
+        restore_progress.write_state({"stage": "restored", "percent": 100})
+        self.assertEqual(self.get("/startup-ready")[1], "OK")
+        # a fresh process (state in memory lost) must still say ready, from the file
+        keep_alive._startup_state.update({"phase": "waiting"})
+        self.assertEqual(keep_alive.get_startup_phase()["phase"], "ready")
+
+    def test_startup_ready_refuses_non_local_clients(self):
+        self._use_temp_state()
+        h = keep_alive.PingHandler.__new__(keep_alive.PingHandler)
+        h.client_address = ("203.0.113.9", 5555)
+        h.path = "/startup-ready"
+        sent = []
+        h._send = lambda code, ctype, body, extra=None: sent.append(code)
+        h.do_GET()
+        self.assertEqual(sent, [403])
+        self.assertEqual(keep_alive.get_startup_phase()["phase"], "waiting")
+
+    def test_clean_start_flag_is_exposed(self):
+        self._use_temp_state()
+        restore_progress.update_state(stage="clean_start", clean_start=True)
+        self.assertTrue(keep_alive.get_startup_phase()["clean_start"])
+
+    def test_query_strings_do_not_break_the_routes(self):
+        self.assertIn("Hermes Live Stats", self.get("/memory?x=1")[1])
+        self.assertIn("memory", json.loads(self.get("/api/stats?t=123")[1]))
+
+    def test_memory_page_has_progress_banner_and_valid_utf8(self):
+        _, html, _ = self.get("/memory")
+        for ident in ("banner-bar", "banner-pct", "sb-eta", "sb-speed", "sb-left", "renderStartup"):
+            self.assertIn(ident, html)
+
+    def test_page_js_has_no_lone_surrogates(self):
+        keep_alive.HTML_PAGE.encode("utf-8")        # raises if a \ud83d-style half emoji sneaks in
 
     def test_rewrite_html_links_unit(self):
         r = keep_alive.rewrite_html_links

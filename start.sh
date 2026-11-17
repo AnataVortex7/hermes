@@ -4,12 +4,20 @@ export TZ="Asia/Kolkata"
 
 echo "=== [PicoW Clow Koyeb Instant Startup & Background Sync] ==="
 
-rm -f /tmp/shutting_down /tmp/restore.log /tmp/setup_picoclaw.log /tmp/picoclaw.log /tmp/stream_proxy.log
+rm -f /tmp/shutting_down /tmp/restore_progress.json /tmp/restore.log /tmp/setup_picoclaw.log /tmp/picoclaw.log /tmp/stream_proxy.log
 
 # 1. START KEEP-ALIVE SERVER INSTANTLY
 if [ -f /app/keep_alive.py ]; then
   echo ">> Starting keep-alive HTTP server immediately..."
-  python3 /app/keep_alive.py &
+  # supervised: if it ever crashes the platform health check must not start failing until the next redeploy
+  (
+    while [ ! -f /tmp/shutting_down ]; do
+      python3 /app/keep_alive.py
+      [ -f /tmp/shutting_down ] && break
+      echo ">> keep_alive.py exited - restarting in 2s"
+      sleep 2
+    done
+  ) &
 fi
 
 # 1a. RAM GUARD: kills the agent job that spikes RAM >= 91% (before the Linux OOM killer), supervised.
@@ -119,29 +127,47 @@ fi
 
 REMOTE_BACKUP="${RCLONE_REMOTE:-gdrive:picow_clow_backup}"
 
+RCLONE_EXCLUDES=(--exclude "cache/**" --exclude "audio_cache/**" --exclude "image_cache/**" --exclude "runtime/**" --exclude "node_modules/**" --exclude ".env")
 rclone_sync() {
-  rclone "$@" \
-    --exclude "cache/**" \
-    --exclude "audio_cache/**" \
-    --exclude "image_cache/**" \
-    --exclude "runtime/**" \
-    --exclude "node_modules/**" \
-    --exclude ".env"
+  rclone "$@" "${RCLONE_EXCLUDES[@]}"
 }
 
 # PicoClaw state (sessions, memory, workspace) is backed up next to the rest.
 # config.json / .security.yml hold the bot token + API key, so they are NOT
 # synced to Drive - they are regenerated from env vars on every boot.
 PICOCLAW_REMOTE="${REMOTE_BACKUP}/picoclaw"
+PICOCLAW_EXCLUDES=(--exclude "config.json" --exclude ".security.yml" --exclude "*.log" --exclude "*.pid" --exclude "*.lock" --exclude "*.sock" --exclude "cache/**")
 picoclaw_sync() {
-  rclone "$@" \
-    --exclude "config.json" \
-    --exclude ".security.yml" \
-    --exclude "*.log" \
-    --exclude "*.pid" \
-    --exclude "*.lock" \
-    --exclude "*.sock" \
-    --exclude "cache/**"
+  rclone "$@" "${PICOCLAW_EXCLUDES[@]}"
+}
+
+# Live restore progress for the /memory dashboard (percent, MB, speed, time left). See restore_progress.py.
+progress_stage() {  # progress_stage <stage> <message> [--clean-start]
+  [ -f /app/restore_progress.py ] || return 0
+  python3 /app/restore_progress.py --stage "$1" --message "$2" $3 >/dev/null 2>&1 || true
+}
+
+# Restore speed. rclone defaults (4 transfers, 8 checkers, Drive pacer 100ms = ~10 requests/s) are very slow for a backup made
+# of many small files. Tunable with RESTORE_TRANSFERS / RESTORE_CHECKERS / RESTORE_EXTRA_FLAGS. The faster Drive pacer is used
+# ONLY when your own Google API client_id is in the rclone config: the shared default rclone client is throttled by Google
+# and would answer with 403 rateLimitExceeded errors.
+RESTORE_SPEED=(--transfers "${RESTORE_TRANSFERS:-8}" --checkers "${RESTORE_CHECKERS:-16}")
+if grep -qE '^[[:space:]]*client_id[[:space:]]*=[[:space:]]*[^[:space:]]' ~/.config/rclone/rclone.conf 2>/dev/null; then
+  RESTORE_SPEED+=(--drive-pacer-min-sleep 10ms --drive-pacer-burst 200)
+fi
+# shellcheck disable=SC2206
+[ -n "${RESTORE_EXTRA_FLAGS:-}" ] && RESTORE_SPEED+=(${RESTORE_EXTRA_FLAGS})
+
+# One restore attempt: both rclone syncs, with live progress. Falls back to the plain commands if the helper is missing.
+do_restore() {
+  if [ -f /app/restore_progress.py ]; then
+    python3 /app/restore_progress.py --attempt "$ATTEMPT" --attempts "${RESTORE_MAX_ATTEMPTS:-2}" -- \
+      "History and settings" rclone sync "$REMOTE_BACKUP" ~/.picow_clow/ "${RCLONE_EXCLUDES[@]}" --exclude "picoclaw/**" --drive-chunk-size 8M "${RESTORE_SPEED[@]}" \
+      +++ "PicoClaw data" rclone sync "$PICOCLAW_REMOTE" ~/.picoclaw/ "${PICOCLAW_EXCLUDES[@]}" --drive-chunk-size 8M "${RESTORE_SPEED[@]}"
+  else
+    rclone_sync sync "$REMOTE_BACKUP" ~/.picow_clow/ --drive-chunk-size 8M --exclude "picoclaw/**" "${RESTORE_SPEED[@]}" \
+      && picoclaw_sync sync "$PICOCLAW_REMOTE" ~/.picoclaw/ --drive-chunk-size 8M "${RESTORE_SPEED[@]}"
+  fi
 }
 
 # 3. Restore from Google Drive (ensure remote folder exists or handle first run)
@@ -166,8 +192,7 @@ if [ -f ~/.config/rclone/rclone.conf ]; then
     rclone mkdir "$REMOTE_BACKUP" 2>/dev/null || true
     rclone mkdir "$PICOCLAW_REMOTE" 2>/dev/null || true
     : > /tmp/restore.log
-    if rclone_sync sync "$REMOTE_BACKUP" ~/.picow_clow/ --drive-chunk-size 8M --exclude "picoclaw/**" >> /tmp/restore.log 2>&1 \
-       && picoclaw_sync sync "$PICOCLAW_REMOTE" ~/.picoclaw/ --drive-chunk-size 8M >> /tmp/restore.log 2>&1; then
+    if do_restore >> /tmp/restore.log 2>&1; then
       cat /tmp/restore.log
       SYNC_SAFE=1; RESTORE_OK=1
       RESTORE_SECS=$(( $(date +%s) - RESTORE_START ))
@@ -184,6 +209,7 @@ if [ -f ~/.config/rclone/rclone.conf ]; then
       find ~/.picoclaw ~/.picow_clow -mindepth 1 -delete 2>/dev/null || true
       mkdir -p ~/.picow_clow ~/.picoclaw
       CLEAN_START=1
+      progress_stage clean_start "Restore failed ${ATTEMPT} times - starting with a CLEAN history" --clean-start
       notify "🧹 Restore $ATTEMPT वेळा फेल झाला, म्हणून PicoClaw CLEAN history ने start होतोय (जुनी history या वेळी नाही).
 ⚠️ Drive वरचा जुना backup सुरक्षित ठेवण्यासाठी या run चा Drive sync बंद आहे. Drive ठीक झाल्यावर Koyeb मध्ये redeploy/restart केला की जुनी history परत येईल.
 
@@ -195,9 +221,11 @@ ${RESTORE_ERR:-(कोणताही error log सापडला नाही)
 
 📋 Error Log:
 ${RESTORE_ERR:-(कोणताही error log सापडला नाही)}"
+    progress_stage retrying "Restore failed (attempt ${ATTEMPT}) - retrying in 20s"
     sleep 20
   done
 else
+  progress_stage no_restore "No rclone config - nothing to restore (fresh state)"
   echo ">> No rclone config - nothing to restore (fresh state)."
   notify "⚠️ rclone config नाही, म्हणून Drive restore झालं नाही (fresh state). RCLONE_CONFIG_BASE64 तपासा."
 fi
@@ -206,6 +234,7 @@ mkdir -p "$PYTHONUSERBASE"
 
 # 3b. Replay packages installed earlier via the bin/ wrappers (apt/pip/npm)
 INST=~/.picow_clow/installed
+{ [ -s "$INST/apt.list" ] || [ -s "$INST/pip.list" ] || [ -s "$INST/npm.list" ]; } && progress_stage packages "Re-installing saved packages..."
 if [ -s "$INST/apt.list" ]; then
   echo ">> Re-installing apt packages: $(tr '\n' ' ' < $INST/apt.list)"
   apt-get update -qq && apt-get install -y --no-install-recommends $(cat "$INST/apt.list") || echo ">> apt replay failed"

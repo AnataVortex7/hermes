@@ -5,10 +5,12 @@ import os
 import re
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 
 from sysstats import Stats
+import restore_progress
 
 # ── Accurate container stats (cgroup based, see sysstats.py) ──
 STATS = Stats()
@@ -63,11 +65,30 @@ def set_startup_ready():
     with _startup_lock:
         _startup_state["phase"] = "ready"
         _startup_state["message"] = "Hermes is fully operational."
+    # also persisted in the progress file: if this process is restarted, the dashboard must not fall back to "restoring"
+    restore_progress.update_state(stage="ready", ready=True, message="Hermes is fully operational.")
 
 
 def get_startup_phase():
+    """{"phase": waiting|ready, "message", "restore": {live restore progress written by restore_progress.py}}"""
     with _startup_lock:
-        return _startup_state.copy()
+        out = _startup_state.copy()
+    st = restore_progress.read_state()
+    if st.get("ready"):
+        out["phase"] = "ready"
+    if out["phase"] != "ready" and st.get("stage"):
+        out["message"] = st.get("message") or out["message"]
+    restore = {k: st[k] for k in (
+        "stage", "message", "attempt", "attempts", "phase", "phases", "label", "percent", "bytes_done",
+        "bytes_total", "files_done", "files_total", "speed_bps", "eta_seconds", "elapsed_seconds", "estimated",
+        "current", "error") if k in st}
+    if restore:
+        age = max(0, int(time.time() - st.get("updated", time.time())))
+        restore["age_seconds"] = age
+        restore["stalled"] = st.get("stage") in ("scanning", "restoring") and age > 30   # no update for 30s
+    out["restore"] = restore
+    out["clean_start"] = bool(st.get("clean_start"))
+    return out
 
 
 def port_open(port, timeout=0.5):
@@ -133,12 +154,24 @@ setInterval(upd,3000);upd();
 
 # ── /memory page ──
 STARTUP_BANNER = """
-<div id="startup-banner" style="background:linear-gradient(135deg,#1e3a5f,#0f2744);border:1px solid #38bdf8;border-radius:12px;padding:20px 24px;margin-bottom:20px;display:flex;align-items:center;gap:16px;">
-  <div style="font-size:32px;">⏳</div>
-  <div>
-    <div style="color:#38bdf8;font-weight:700;font-size:16px;" id="banner-title">Restoring from Google Drive...</div>
-    <div style="color:#94a3b8;font-size:13px;margin-top:4px;" id="banner-sub">Hermes history, skills, and state are being restored. Gateway will start automatically once ready.</div>
+<div id="startup-banner" class="hidden">
+  <div class="sb-top">
+    <div class="sb-icon" id="banner-icon">&#9203;</div>
+    <div class="sb-text">
+      <div class="sb-title" id="banner-title">Starting up...</div>
+      <div class="sb-sub" id="banner-sub"></div>
+    </div>
+    <div class="sb-pct" id="banner-pct"></div>
   </div>
+  <div class="sb-bar"><div class="sb-fill" id="banner-bar" style="width:0%"></div></div>
+  <div class="sb-grid" id="banner-grid">
+    <div><span>Restored</span><b id="sb-done">-</b></div>
+    <div><span>Remaining</span><b id="sb-left">-</b></div>
+    <div><span>Speed</span><b id="sb-speed">-</b></div>
+    <div><span>Time left</span><b id="sb-eta">-</b></div>
+  </div>
+  <div class="sb-line" id="banner-files"></div>
+  <div class="sb-err" id="banner-err"></div>
 </div>
 """
 
@@ -172,8 +205,29 @@ th { color: #94a3b8; font-weight: 600; font-size: 12px; text-transform: uppercas
 td { color: #e2e8f0; }
 tr:last-child td { border-bottom: none; }
 footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 12px; line-height: 1.6; }
-#startup-banner { transition: opacity 0.5s; }
-#startup-banner.hidden { opacity: 0; pointer-events: none; display: none !important; }
+#startup-banner { background: linear-gradient(135deg,#1e3a5f,#0f2744); border: 1px solid #38bdf8; border-radius: 12px; padding: 18px 20px; margin-bottom: 20px; }
+#startup-banner.hidden { display: none !important; }
+#startup-banner.bad { border-color: #f43f5e; background: linear-gradient(135deg,#3b1418,#1f0b0e); }
+#startup-banner.good { border-color: #34d399; }
+.sb-top { display: flex; align-items: center; gap: 14px; }
+.sb-icon { font-size: 30px; }
+.sb-text { flex: 1; min-width: 0; }
+.sb-title { color: #38bdf8; font-weight: 700; font-size: 16px; }
+#startup-banner.bad .sb-title { color: #fb7185; }
+.sb-sub { color: #94a3b8; font-size: 13px; margin-top: 3px; word-break: break-word; }
+.sb-pct { font-size: 30px; font-weight: 800; color: #f8fafc; white-space: nowrap; }
+.sb-bar { width: 100%; height: 12px; background: #334155; border-radius: 6px; overflow: hidden; margin: 14px 0 12px; position: relative; }
+.sb-fill { height: 100%; background: #38bdf8; border-radius: 6px; transition: width 0.8s ease; }
+#startup-banner.good .sb-fill { background: #34d399; }
+#startup-banner.bad .sb-fill { background: #f43f5e; }
+.sb-bar.indet .sb-fill { width: 35% !important; position: absolute; animation: sbslide 1.4s ease-in-out infinite; }
+@keyframes sbslide { 0% { left: -35%; } 100% { left: 100%; } }
+.sb-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+.sb-grid div { background: rgba(15,23,42,0.55); border-radius: 8px; padding: 8px 10px; }
+.sb-grid span { display: block; color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+.sb-grid b { color: #f8fafc; font-size: 15px; }
+.sb-line { color: #94a3b8; font-size: 12px; margin-top: 10px; word-break: break-word; }
+.sb-err { color: #fecdd3; font-size: 12px; margin-top: 8px; white-space: pre-wrap; word-break: break-word; }
 .dash-link { display: inline-block; margin-top: 10px; color: #38bdf8; font-size: 13px; text-decoration: none; }
 .dash-link:hover { text-decoration: underline; }
 .warn { color: #f43f5e; font-weight: 700; }
@@ -230,6 +284,69 @@ footer { text-align: center; margin-top: 24px; color: #64748b; font-size: 12px; 
 </div>
 <script>
 function $(id){return document.getElementById(id);}
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  var u = ['KB', 'MB', 'GB', 'TB'], i = -1;
+  do { n = n / 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(n >= 100 ? 0 : 1) + ' ' + u[i];
+}
+function fmtEta(s) {
+  if (s === null || s === undefined) return 'calculating...';
+  if (Math.round(s) <= 1) return 'almost done';
+  return fmtDur(s);
+}
+function fmtDur(s) {
+  s = Math.round(Number(s) || 0);
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + ('0' + (s % 60)).slice(-2) + 's';
+  return Math.floor(s / 3600) + 'h ' + ('0' + Math.floor((s % 3600) / 60)).slice(-2) + 'm';
+}
+function renderStartup(st) {
+  var b = $('startup-banner');
+  if (!st || st.phase === 'ready') { b.classList.add('hidden'); return; }
+  b.classList.remove('hidden');
+  var r = st.restore || {}, stage = r.stage || '';
+  var bar = document.querySelector('.sb-bar'), fill = $('banner-bar');
+  var title = st.message || 'Starting up...', sub = '', icon = '\u23f3', pct = '', cls = '', indet = false, showGrid = false;
+  if (stage === 'scanning' || !stage) {
+    title = stage ? 'Scanning Google Drive backup...' : (st.message || 'Starting up...');
+    sub = 'Measuring how much has to be restored, so the progress and time left are accurate.'; indet = true; icon = '🔎';
+  } else if (stage === 'restoring') {
+    var p = Math.max(0, Math.min(100, Number(r.percent) || 0));
+    title = 'Restoring from Google Drive' + (r.phases > 1 ? ' (' + r.phase + '/' + r.phases + ': ' + r.label + ')' : '');
+    sub = 'History, skills and state are coming back. PicoClaw starts automatically when this reaches 100%.' + (r.attempt > 1 ? ' (attempt ' + r.attempt + ')' : '');
+    pct = (r.estimated ? '~' : '') + p.toFixed(p < 10 ? 1 : 0) + '%'; fill.style.width = p + '%'; showGrid = true;
+  } else if (stage === 'restored' || stage === 'packages') {
+    title = stage === 'packages' ? 'Re-installing saved packages...' : 'Restore complete, finishing up...';
+    sub = 'Almost there.'; pct = '100%'; fill.style.width = '100%'; cls = 'good'; icon = '\u2705';
+  } else if (stage === 'failed' || stage === 'retrying') {
+    title = stage === 'retrying' ? (st.message || 'Retrying restore...') : (r.message || 'Restore failed');
+    sub = 'PicoClaw is not started yet.'; cls = 'bad'; icon = '\u26a0\ufe0f'; fill.style.width = (Number(r.percent) || 0) + '%';
+  } else if (stage === 'clean_start') {
+    title = st.message || 'Starting with a clean history'; cls = 'bad'; icon = '🧹'; indet = true;
+  } else {
+    sub = st.message || ''; indet = true;
+  }
+  if (r.stalled) { sub = 'No progress update for ' + r.age_seconds + 's - Google Drive may be slow or rclone is stuck. ' + sub; }
+  b.className = cls;
+  bar.className = 'sb-bar' + (indet ? ' indet' : '');
+  $('banner-icon').textContent = icon;
+  $('banner-title').textContent = title;
+  $('banner-sub').textContent = sub;
+  $('banner-pct').textContent = pct;
+  $('banner-grid').style.display = showGrid ? '' : 'none';
+  if (showGrid) {
+    var left = Math.max(0, (r.bytes_total || 0) - (r.bytes_done || 0));
+    $('sb-done').textContent = fmtBytes(r.bytes_done) + ' / ' + fmtBytes(r.bytes_total);
+    $('sb-left').textContent = fmtBytes(left);
+    $('sb-speed').textContent = (r.speed_bps ? fmtBytes(r.speed_bps) + '/s' : '-');
+    $('sb-eta').textContent = r.estimated ? 'unknown' : fmtEta(r.eta_seconds);
+  }
+  var cur = (r.current || []).map(function(c){ return c.name + ' ' + c.percent + '%'; }).join('  |  ');
+  $('banner-files').textContent = (showGrid ? 'Files: ' + (r.files_done || 0) + ' / ' + (r.files_total || 0) + ' | elapsed ' + fmtDur(r.elapsed_seconds) : '') + (cur && showGrid ? ' | now: ' + cur : '');
+  $('banner-err').textContent = (cls === 'bad' && r.error) ? r.error : '';
+}
 function updateStats() {
   return fetch('/api/stats', {cache: 'no-store'}).then(function(r){return r.json();}).then(function(d) {
     var m=d.memory, k=d.disk, c=d.cpu;
@@ -253,8 +370,7 @@ function updateStats() {
     $('cpu-sub').textContent = 'Using ' + c.cores_used + ' vCPU • avg 1m/5m/15m: ' + c.avg['1m'] + '% / ' + c.avg['5m'] + '% / ' + c.avg['15m'] + '% • throttled: ' + c.throttled_percent + '%';
     $('uptime').textContent = d.uptime;
     $('foot').textContent = 'Auto-refreshing every 2 seconds (paused while this tab is hidden) • only the container plan allotment, not the host • RAM/CPU from ' + m.source + ' (limits: ' + m.limit_source + '; ' + c.limit_source + ') • disk limit: ' + k.limit_source;
-    if (d.startup && d.startup.phase === 'ready') { $('startup-banner').classList.add('hidden'); }
-    else if (d.startup) { $('banner-title').textContent = d.startup.message || 'Restoring...'; }
+    renderStartup(d.startup);
     var tbody = $('proc-table'); tbody.innerHTML = '';
     d.processes.forEach(function(p) {
       var tr = document.createElement('tr');
@@ -268,12 +384,14 @@ function updateStats() {
       ct.appendChild(tr);
     });
     var al = $('alerts'); al.innerHTML = '';
-    if (d.alerts && d.alerts.length) {
+    var alerts = (d.alerts || []).slice();
+    if (d.startup && d.startup.clean_start) { alerts.push('Drive restore failed, so this run started with a CLEAN history. Drive sync is OFF for this run (the old backup on Drive is safe). Fix Drive and restart to get the history back.'); }
+    if (alerts.length) {
       var box = document.createElement('div'); box.className = 'alert';
-      d.alerts.forEach(function(a, i){ if (i) box.appendChild(document.createElement('br')); box.appendChild(document.createTextNode('\u26a0 ' + a)); });
+      alerts.forEach(function(a, i){ if (i) box.appendChild(document.createElement('br')); box.appendChild(document.createTextNode('\u26a0 ' + a)); });
       al.appendChild(box);
     }
-    document.title = (d.alerts && d.alerts.length ? '\u26a0 ' : '') + 'Hermes Live Stats';
+    document.title = (alerts.length ? '\u26a0 ' : '') + 'Hermes Live Stats';
   }).catch(function(err) { console.error('Stats fetch error:', err); });
 }
 function loop() {
@@ -400,14 +518,19 @@ class PingHandler(http.server.BaseHTTPRequestHandler):
 
     # ── routes ──
     def do_GET(self):
+        route = self.path.split("?", 1)[0]
         if _is_picoclaw_path(self.path):
             self._picoclaw("GET")
-        elif self.path == '/memory':
+        elif route == '/memory':
             self._send(200, 'text/html; charset=utf-8', HTML_PAGE)
-        elif self.path == '/api/stats':
-            self._send(200, 'application/json', json.dumps(get_stats()))
-        elif self.path == '/startup-ready':
-            # start.sh हा endpoint call करतो जेव्हा restore पूर्ण होतो
+        elif route == '/api/stats':
+            self._send(200, 'application/json', json.dumps(get_stats()), {"Cache-Control": "no-store"})
+        elif route == '/startup-ready':
+            # start.sh calls this when the restore is finished. Only from this machine: a stranger must not be able
+            # to hide the "restoring" banner by opening the URL.
+            if self.client_address[0] not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+                self._send(403, 'text/plain', b"forbidden")
+                return
             set_startup_ready()
             self._send(200, 'text/plain', b"OK")
         else:

@@ -107,6 +107,23 @@ On every boot a marked block is (re)written into `workspace/USER.md` telling the
 permissions, so stale "cron is restricted" notes in its memory stop making it refuse.
 Python packages persist via `PYTHONUSERBASE=~/.picow_clow/pyuser` (synced to Drive).
 
+## Live restore progress on the dashboard (`/memory`)
+While the Drive restore runs, the top of the `/memory` page shows a progress card: **percent, MB restored / total,
+MB remaining, speed, time left (ETA), files done / total** and the file being copied. `start.sh` runs the restore through
+`restore_progress.py`, which first measures the backup size (`rclone size`, same excludes as the sync) and then reads
+rclone's JSON stats once a second, so the percentage and ETA are real. Stages shown: scanning -> restoring -> (re-installing
+packages) -> ready; a failed attempt shows the error text and "retrying"; a stuck restore (no update for 30 s) is flagged;
+a CLEAN-history start leaves a warning on the dashboard. The same numbers are in `/api/stats` -> `startup.restore`.
+If the size scan fails the card still works but says `~` (approximate) and shows no ETA. `RESTORE_SIZE_TIMEOUT` (default 180 s)
+limits the scan; `RESTORE_PROGRESS_FILE` (default `/tmp/restore_progress.json`) is the state file.
+
+### Restore speed
+Restore uses `--transfers 8 --checkers 16` (rclone default is 4 / 8). If your rclone config has **your own Google `client_id`**
+(recommended), it also uses `--drive-pacer-min-sleep 10ms --drive-pacer-burst 200` (default pacer = ~10 requests/s, the main
+bottleneck for many small files). Env overrides: `RESTORE_TRANSFERS`, `RESTORE_CHECKERS`, `RESTORE_EXTRA_FLAGS` (e.g. `--tpslimit 8`).
+If the container runs out of RAM during restore lower `RESTORE_TRANSFERS` (e.g. 4). If the log shows `rateLimitExceeded`, lower it
+or set `RESTORE_EXTRA_FLAGS="--tpslimit 8"`.
+
 ## Restart / restore notifications
 On every boot `start.sh` messages every numeric id in `TELEGRAM_ALLOW_FROM` (you must have pressed
 /start on the bot once):
