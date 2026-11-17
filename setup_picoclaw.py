@@ -347,6 +347,10 @@ def main() -> None:
 
     config_path = picoclaw_home / "config.json"
     config_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(config_path, 0o600)      # contains the Telegram token and the API key
+    except OSError:
+        pass
     print(f"Generated unrestricted PicoClaw config at {config_path} (live stream proxy -> {upstream_base})")
     print(f"context_window={context_window} max_tokens={max_tokens} attempt_timeout={request_timeout}s "
           f"total_budget={total_budget}s picoclaw_request_timeout={picoclaw_timeout}s "

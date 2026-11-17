@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 import urllib.error
+import traceback
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -81,7 +82,7 @@ TIMEOUT_RETRIES = _env_int("LLM_TIMEOUT_RETRIES", 1)    # 408/504/524 or no answ
 BAD_REPLY_RETRIES = _env_int("LLM_GUARD_MAX_RETRIES", 2)  # bad/empty/stalled replies
 BACKOFF = _env_float("LLM_RETRY_BACKOFF", 2.0)
 LITE_RE = re.compile(os.environ.get("LLM_LITE_PATTERN", "lite") or "lite", re.I)
-KEEPALIVE_SECS = float(os.environ.get("LLM_SSE_KEEPALIVE", "8"))   # comment pings while a streamed reply is validated
+KEEPALIVE_SECS = _env_float("LLM_SSE_KEEPALIVE", 8.0)   # comment pings while a streamed reply is validated
 GUARD_STREAM = (os.environ.get("LLM_GUARD_STREAM", "1").strip() != "0")   # validate agent turns even if PicoClaw asked for SSE
 try:
     AGENT_TEMPERATURE = float((os.environ.get("LLM_AGENT_TEMPERATURE", "0.3") or "").strip())  # "" = leave as is
@@ -349,8 +350,8 @@ def rewrite_send_file_result(payload):
 _TURN_ENDING_TOOLS = {"send_file"}
 _WORK_TOOLS = {"write_file", "edit_file", "append_file", "exec", "spawn", "subagent", "install_skill", "cron"}
 _SLOW_TOOLS = {"exec", "spawn", "subagent", "web_fetch", "web_search", "cron", "install_skill", "find_skills"}
-QUICK_TOOL_IDLE = float(os.environ.get("TYPING_QUICK_TOOL_IDLE", "150"))
-_MIN_EXPLANATION_CHARS = int(os.environ.get("MIN_EXPLANATION_CHARS", "120"))
+QUICK_TOOL_IDLE = _env_float("TYPING_QUICK_TOOL_IDLE", 150.0)
+_MIN_EXPLANATION_CHARS = _env_int("MIN_EXPLANATION_CHARS", 120)
 
 
 def _longest_text(args):
@@ -716,34 +717,36 @@ _ram_lock = threading.Lock()
 def ram_guard_notice():
     """Text for the agent when ram_guard.py killed one of its processes recently (else ''). Shown in the next few
     agent requests only (not stored in history), so the model stops repeating the same heavy approach."""
-    try:
-        with open(RAM_EVENTS, encoding="utf-8") as fh:
-            lines = fh.read().splitlines()[-5:]
-    except OSError:
-        return ""
-    now, shown, parts, changed = time.time(), [], [], False
-    for ln in lines:
+    with _ram_lock:            # read-modify-write as one step: parallel requests must not double-count or lose events
         try:
-            ev = json.loads(ln)
-        except ValueError:
-            continue
-        if ev.get("killed") and now - ev.get("t", 0) <= RAM_NOTICE_TTL and ev.get("shown", 0) < RAM_NOTICE_MAX:
-            ev["shown"] = ev.get("shown", 0) + 1
-            changed = True
-            parts.append(
-                f"[hermes-ram-guard] The server RAM guard KILLED your process `{ev['cmd'][:160]}` "
-                f"(pid {ev['pid']}, {ev['job_mb']} MB, grew {ev['grew_mb']} MB just before) because container RAM went "
-                f"{ev['before_percent']}% -> over the {ev['limit_mb']} MB limit; it was killed to protect the server "
-                "(the Linux OOM killer would have killed something important). Its output may be incomplete. "
-                "Do NOT rerun the same command the same way. Use a lighter/smarter alternative: "
-                + " | ".join(ev.get("tips", [])) + ". Run `ramguard status` to see free RAM, then continue the task "
-                "step by step with small batches, and tell the user briefly what happened and what you changed.")
-        shown.append(ev)
-    if changed:
-        with _ram_lock:
+            with open(RAM_EVENTS, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()[-5:]
+        except OSError:
+            return ""
+        now, shown, parts, changed = time.time(), [], [], False
+        for ln in lines:
             try:
-                with open(RAM_EVENTS, "w", encoding="utf-8") as fh:
+                ev = json.loads(ln)
+            except ValueError:
+                continue
+            if ev.get("killed") and now - ev.get("t", 0) <= RAM_NOTICE_TTL and ev.get("shown", 0) < RAM_NOTICE_MAX:
+                ev["shown"] = ev.get("shown", 0) + 1
+                changed = True
+                parts.append(
+                    f"[hermes-ram-guard] The server RAM guard KILLED your process `{ev['cmd'][:160]}` "
+                    f"(pid {ev['pid']}, {ev['job_mb']} MB, grew {ev['grew_mb']} MB just before) because container RAM went "
+                    f"{ev['before_percent']}% -> over the {ev['limit_mb']} MB limit; it was killed to protect the server "
+                    "(the Linux OOM killer would have killed something important). Its output may be incomplete. "
+                    "Do NOT rerun the same command the same way. Use a lighter/smarter alternative: "
+                    + " | ".join(ev.get("tips", [])) + ". Run `ramguard status` to see free RAM, then continue the task "
+                    "step by step with small batches, and tell the user briefly what happened and what you changed.")
+            shown.append(ev)
+        if changed:
+            try:
+                tmp = RAM_EVENTS + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
                     fh.write("\n".join(json.dumps(e, ensure_ascii=False) for e in shown) + "\n")
+                os.replace(tmp, RAM_EVENTS)
             except OSError:
                 pass
     return "\n".join(parts)
@@ -1373,8 +1376,11 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
 
         target_url = build_upstream_url(self.path)
         try:
+            # Every chat call (agent turns AND background calls such as PicoClaw's history summary, which has no
+            # tools) goes through the same path: keep-alive pings, retries and the full time budget. Only the reply
+            # validation is limited to agent turns (guard_on inside _guarded_chat_inner).
             if payload is not None and is_chat and (
-                not client_wants_stream or (GUARD and GUARD_STREAM and payload.get("tools"))
+                not client_wants_stream or not payload.get("tools") or (GUARD and GUARD_STREAM)
             ):
                 self._guarded_chat(target_url, payload, as_stream=client_wants_stream)
                 return
@@ -1387,8 +1393,16 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
                 TYPING.finish()               # request failed: do not leave "typing..." on
                 if STATUS is not None:
                     STATUS.finish()
-            log(f"request failed: {exc!r}")
-            notify_owner(f"⚠️ LLM request fail झाला: {str(exc)[:200]}. काम थांबलं असू शकतं — 'continue' पाठवा.")
+            log(f"request failed: {exc!r}\n{traceback.format_exc()}")
+            # Broken pipe / reset = PicoClaw itself closed the connection (e.g. it gave up on a slow background
+            # summary). That is not a failed job: only log it. Also never alarm the owner for non-agent calls
+            # (summaries have no tools), only for real agent turns.
+            client_gone = isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError))
+            is_agent = bool(isinstance(payload, dict) and payload.get("tools"))
+            if client_gone:
+                log("client (PicoClaw) closed the connection before the reply was sent - no owner notice")
+            elif is_agent:
+                notify_owner(f"⚠️ LLM request fail झाला: {str(exc)[:200]}. काम थांबलं असू शकतं — 'continue' पाठवा.")
             try:
                 self._finish_ka()
                 if getattr(self, "_sse_open", False):
@@ -1444,7 +1458,9 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
                     self._open_sse()
                     self.wfile.write(b": keep-alive\n\n")
                     self.wfile.flush()
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    self._client_gone = True      # PicoClaw closed the connection: stop wasting upstream calls
+                    log(f"client closed the connection during keep-alive ({exc!r})")
                     return
         self._ka_thread = threading.Thread(target=run, daemon=True)
         self._ka_thread.start()
@@ -1491,6 +1507,7 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
 
     def _guarded_chat(self, target_url, payload, as_stream=False):
         self._sse_open = False
+        self._client_gone = False
         if as_stream and KEEPALIVE_SECS > 0:
             self._start_keepalive()
         try:
@@ -1525,6 +1542,13 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
         retry_deadline = call_started + max(TOTAL_BUDGET - 30, 60)   # stay inside PicoClaw's own request timeout
         premature_retried = False
         while True:
+            if getattr(self, "_client_gone", False):
+                log("client (PicoClaw) disconnected - not retrying upstream")
+                if agent_turn and TYPING is not None:
+                    TYPING.finish()
+                    if STATUS is not None:
+                        STATUS.finish()
+                return
             started = time.time()
             hard_deadline = min(started + TIMEOUT, call_started + TOTAL_BUDGET)   # per attempt, never past the budget
             if agent_turn and TYPING is not None:
@@ -1591,9 +1615,10 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
                 finish = ch.get("finish_reason")
             except (KeyError, IndexError, TypeError):
                 n_calls, finish = 0, None
-            with _state_lock:
-                _state["last_model"] = model
-                _state["last_was_bad"] = reason is not None
+            if agent_turn:       # a background call (history summary) must not reset the agent's reminder state
+                with _state_lock:
+                    _state["last_model"] = model
+                    _state["last_was_bad"] = reason is not None
             log(
                 f"model={model or '?'} finish={finish} tool_calls={n_calls} "
                 f"reason={reason or 'ok'} retry={semantic_retries} ms={int((time.time() - started) * 1000)} "

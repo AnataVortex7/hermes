@@ -497,6 +497,40 @@ class ProxyTests(unittest.TestCase):
         self.assertLess(text.index(": keep-alive"), text.index('"content": "done"'))
         self.assertTrue(text.rstrip().endswith("[DONE]"))
 
+    def test_background_call_without_tools_also_gets_keepalive(self):
+        """PicoClaw's history summary has stream=true and NO tools: it must get the same keep-alive pings."""
+        old = self.mod.KEEPALIVE_SECS
+        self.mod.KEEPALIVE_SECS = 0.2
+        self.addCleanup(setattr, self.mod, "KEEPALIVE_SECS", old)
+        SCRIPT.append(("slow_alive", text_chunks("summary text")))
+        _, raw = self.call(self.msg(), tools=False, stream=True)
+        text = raw.decode()
+        self.assertIn(": keep-alive", text)
+        self.assertIn("summary text", text)
+        self.assertTrue(text.rstrip().endswith("[DONE]"))
+
+    def test_background_call_does_not_reset_agent_state(self):
+        self.mod._state.update(last_model="gemini-lite", last_was_bad=True)
+        SCRIPT.append(sse(*text_chunks("a summary")))
+        self.call(self.msg(), tools=False)
+        self.assertTrue(self.mod._state["last_was_bad"])
+        self.assertEqual(self.mod._state["last_model"], "gemini-lite")
+
+    def test_broken_pipe_never_alerts_owner(self):
+        sent = []
+        old = self.mod.notify_owner
+        self.mod.notify_owner = sent.append
+        self.addCleanup(setattr, self.mod, "notify_owner", old)
+        h = self.mod.GuardProxyHandler.__new__(self.mod.GuardProxyHandler)
+        h.headers = {"Content-Length": "0"}
+        h.path = "/v1/models"
+        h.command = "GET"
+        h.rfile = __import__("io").BytesIO(b"")
+        h._passthrough = lambda *a, **k: (_ for _ in ()).throw(BrokenPipeError(32, "Broken pipe"))
+        h._send_json = lambda *a, **k: None
+        h._handle_request()
+        self.assertEqual(sent, [])
+
     def test_streaming_client_upstream_error_after_keepalive_is_reported_in_band(self):
         old = self.mod.KEEPALIVE_SECS
         self.mod.KEEPALIVE_SECS = 0.1
