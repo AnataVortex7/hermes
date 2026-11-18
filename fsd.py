@@ -8,13 +8,16 @@ Everything is streamed in 256 KB chunks, so RAM stays flat for any file size.
 
   GET  /fs/ping                         host, root, disk free/total
   GET  /fs/list?path=/etc               directory listing
+  GET  /fs/counts?path=/etc[&start=0&n=60]   per sub-folder "N folders / M files" (batched, time-boxed)
+  GET  /fs/search?path=/etc&q=name[&kind=all|files|folders&limit=1000]   recursive search (q may use * ?; empty q = list everything)
   GET  /fs/read?path=/x.bin[&dl=1]      download / inline view (HTTP Range supported)
   PUT  /fs/write?path=/x.bin[&overwrite=1]   upload / save (body = raw bytes, Content-Length required)
   POST /fs/op  {"op": "mkdir"|"delete"|"rename"|"move"|"copy", ...}   (needs header X-Requested-With: fsd)
 
 Env: FS_ENABLED (1), FS_PORT (8765), FS_ROOT (/ = whole machine; set e.g. /root to confine it).
 """
-import os, re, json, stat, shutil, socket, ipaddress, mimetypes, threading, time, errno
+import os, re, json, stat, shutil, socket, ipaddress, mimetypes, threading, time, errno, fnmatch
+from collections import deque
 from urllib.parse import urlsplit, parse_qs, quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -22,6 +25,8 @@ PORT = int(os.environ.get("FS_PORT", "8765") or 8765)
 ROOT = os.path.realpath(os.environ.get("FS_ROOT", "/") or "/")
 CHUNK = 256 * 1024
 MAX_LIST = 10000
+COUNT_CAP = 5000                          # a folder with more entries than this is shown as "5000+"
+PSEUDO = ("/proc", "/sys", "/dev")        # virtual filesystems: never walked by search (still listable by hand)
 HOST_RE = re.compile(r"^(?:\[([0-9a-f:.]+)\]|([^:\[\]]+))(?::\d+)?$")
 
 
@@ -89,6 +94,32 @@ def disk():
         return 0, 0
 
 
+def _place(p):
+    try:
+        real = os.path.realpath(p)
+        if not os.path.isdir(real):
+            return None
+        if ROOT != "/" and real != ROOT and not real.startswith(ROOT + os.sep):
+            return None
+        return virt(real)
+    except OSError:
+        return None
+
+
+def places():
+    """Quick links for the Machines sidebar: where the AI agent keeps its files, home, /tmp."""
+    home = os.path.expanduser("~")
+    ph = os.environ.get("PICOCLAW_HOME") or os.path.join(home, ".picoclaw")
+    ws = os.environ.get("PICOCLAW_WORKSPACE") or os.path.join(ph, "workspace")
+    out, seen = [], set()
+    for name, path in (("Agent workspace", ws), ("Home", home), ("/tmp", "/tmp")):
+        v = _place(path)
+        if v and v not in seen:
+            seen.add(v)
+            out.append({"name": name, "path": v})
+    return out
+
+
 def do_list(path):
     full = resolve(path)
     items, trunc = [], False
@@ -115,6 +146,103 @@ def do_list(path):
         raise oserr(e)
     parent = None if virt(full) == "/" else virt(os.path.dirname(full))
     return {"ok": True, "path": virt(full), "parent": parent, "items": items, "truncated": trunc}
+
+def _isdir(e):
+    try:
+        return e.is_dir()                 # follows symlinks, same as do_list
+    except OSError:
+        return False
+
+
+def _pseudo(v):
+    return any(v == p or v.startswith(p + "/") for p in PSEUDO)
+
+
+def do_counts(path, start=0, n=60, budget=2.0):
+    """{name: [sub-folders, files, capped] | None} for sub-folders [start, start+n) of `path`; stops early after `budget` s."""
+    full = resolve(path)
+    try:
+        with os.scandir(full) as it:
+            names = sorted(e.name for e in it if _isdir(e))
+    except OSError as e:
+        raise oserr(e)
+    t0, out, i = time.time(), {}, max(0, start)
+    end = min(len(names), i + max(1, n))
+    while i < end:
+        if out and time.time() - t0 > budget:
+            break
+        name = names[i]
+        i += 1
+        d = f = 0
+        capped = False
+        try:
+            with os.scandir(os.path.join(full, name)) as it:
+                for k, e in enumerate(it):
+                    if k >= COUNT_CAP:
+                        capped = True
+                        break
+                    if _isdir(e):
+                        d += 1
+                    else:
+                        f += 1
+            out[name] = [d, f, capped]
+        except OSError:
+            out[name] = None              # no permission / vanished
+    return {"ok": True, "counts": out, "next": i if i < len(names) else None, "total": len(names)}
+
+
+def make_matcher(q):
+    q = (q or "").strip().lower()
+    if not q:
+        return lambda name: True
+    if any(c in q for c in "*?["):
+        return lambda name: fnmatch.fnmatchcase(name.lower(), q)
+    return lambda name: q in name.lower()
+
+
+def do_search(path, q, kind="all", limit=1000, budget=10.0):
+    """Breadth-first recursive search below `path` (symlinked folders are not followed; /proc /sys /dev are skipped)."""
+    full = resolve(path)
+    match = make_matcher(q)
+    kind = kind if kind in ("all", "files", "folders") else "all"
+    limit = max(1, min(int(limit or 1000), 5000))
+    skip_pseudo = not _pseudo(virt(full))
+    out, scanned, trunc, timeup = [], 0, False, False
+    t0 = time.time()
+    todo = deque([full])
+    while todo and not trunc:
+        if time.time() - t0 > budget:
+            timeup = True
+            break
+        d = todo.popleft()
+        try:
+            with os.scandir(d) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        scanned += 1
+        entries.sort(key=lambda e: e.name.lower())
+        for e in entries:
+            try:
+                link = e.is_symlink()
+                isdir = e.is_dir()
+            except OSError:
+                continue
+            fp = os.path.join(d, e.name)
+            if isdir and not link and not (skip_pseudo and _pseudo(virt(fp))):
+                todo.append(fp)
+            if (kind == "files" and isdir) or (kind == "folders" and not isdir) or not match(e.name):
+                continue
+            try:
+                st = e.stat(follow_symlinks=False)
+                size, mt = (0 if isdir else st.st_size), int(st.st_mtime)
+            except OSError:
+                size, mt = 0, 0
+            out.append({"n": virt(fp), "d": isdir, "s": size, "m": mt, "l": link})
+            if len(out) >= limit:
+                trunc = True
+                break
+    return {"ok": True, "path": virt(full), "items": out, "truncated": trunc, "timeup": timeup, "scanned": scanned}
 
 
 def _one(fn, path, errs):
@@ -240,9 +368,13 @@ class H(BaseHTTPRequestHandler):
             route = u.path[4:]
             if method == "GET" and route == "ping":
                 free, total = disk()
-                return self._json({"ok": True, "host": socket.gethostname(), "root": ROOT, "free": free, "total": total})
+                return self._json({"ok": True, "host": socket.gethostname(), "root": ROOT, "free": free, "total": total, "places": places()})
             if method == "GET" and route == "list":
                 return self._json(do_list(q.get("path")))
+            if method == "GET" and route == "counts":
+                return self._json(do_counts(q.get("path"), int(q.get("start") or 0), min(int(q.get("n") or 60), 200)))
+            if method == "GET" and route == "search":
+                return self._json(do_search(q.get("path"), q.get("q"), q.get("kind", "all"), int(q.get("limit") or 1000)))
             if method == "GET" and route == "read":
                 return self._read(q)
             if method == "PUT" and route == "write":
@@ -261,6 +393,8 @@ class H(BaseHTTPRequestHandler):
             self._err(e)
         except (BrokenPipeError, ConnectionResetError, socket.timeout):
             self.close_connection = True
+        except ValueError:
+            self._err(FsErr(400, "bad number in query"))
         except Exception as e:  # never let one request kill the thread silently
             self._err(FsErr(500, f"{type(e).__name__}: {e}"[:200]))
 
