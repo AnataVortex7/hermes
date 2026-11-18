@@ -281,6 +281,16 @@ def main() -> None:
     # Max OUTPUT tokens per reply (not the context size).
     max_tokens = env_int("LLM_MAX_TOKENS", 32768)
 
+    # History summarising (PicoClaw "maybeSummarize"): after every turn PicoClaw summarises + PHYSICALLY DELETES old
+    # messages when len(history) > summarize_message_threshold (PicoClaw default 20!) or the history is above
+    # summarize_token_percent % of the context window. With the default 20 this fires after a few tool calls, the
+    # summary is lossy (tool calls/results are not part of it) and the agent forgets the job.
+    # So: the message-count trigger is effectively OFF (a huge number; 0 would fall back to the default 20) and the
+    # summary only runs when the history really fills the context window (default 85 %, was 75 %).
+    # LLM_SUMMARIZE_MESSAGE_THRESHOLD / LLM_SUMMARIZE_TOKEN_PERCENT override this (token percent: 1-99).
+    summarize_message_threshold = env_int("LLM_SUMMARIZE_MESSAGE_THRESHOLD", 1_000_000)
+    summarize_token_percent = min(env_int("LLM_SUMMARIZE_TOKEN_PERCENT", 85), 99)
+
     cron_allowed_remotes = [
         x.strip()
         for x in os.environ.get("CRON_COMMAND_ALLOWED_REMOTES", "telegram").split(",")
@@ -301,6 +311,8 @@ def main() -> None:
                 "subturn": {"default_timeout_minutes": MIN_TIMEOUT // 60},
                 "context_window": context_window,
                 "max_tokens": max_tokens,
+                "summarize_message_threshold": summarize_message_threshold,
+                "summarize_token_percent": summarize_token_percent,
             }
         },
         "model_list": [model_entry],
@@ -352,6 +364,7 @@ def main() -> None:
     except OSError:
         pass
     print(f"Generated unrestricted PicoClaw config at {config_path} (live stream proxy -> {upstream_base})")
+    print(f"summarize_message_threshold={summarize_message_threshold} summarize_token_percent={summarize_token_percent}")
     print(f"context_window={context_window} max_tokens={max_tokens} attempt_timeout={request_timeout}s "
           f"total_budget={total_budget}s picoclaw_request_timeout={picoclaw_timeout}s "
           f"max_tool_iterations={cfg['agents']['defaults']['max_tool_iterations']}")
