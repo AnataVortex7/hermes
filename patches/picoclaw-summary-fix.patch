@@ -1,0 +1,131 @@
+diff --git a/pkg/agent/context_legacy.go b/pkg/agent/context_legacy.go
+index 908c3d8..4567c0c 100644
+--- a/pkg/agent/context_legacy.go
++++ b/pkg/agent/context_legacy.go
+@@ -170,7 +170,7 @@ func (m *legacyContextManager) forceCompression(sessionKey string) (compressionR
+ }
+ 
+ func (m *legacyContextManager) summarizeSession(agent *AgentInstance, sessionKey string) {
+-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
++	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
+ 	defer cancel()
+ 
+ 	history := agent.Sessions.GetHistory(sessionKey)
+@@ -192,15 +192,18 @@ func (m *legacyContextManager) summarizeSession(agent *AgentInstance, sessionKey
+ 	omitted := false
+ 
+ 	for _, msg := range toSummarize {
+-		if msg.Role != "user" && msg.Role != "assistant" {
+-			continue
+-		}
+ 		msgTokens := len(msg.Content) / 2
+ 		if msgTokens > maxMessageTokens {
+ 			omitted = true
+ 			continue
+ 		}
+-		validMessages = append(validMessages, msg)
++		// Tool calls and (truncated) tool results are kept as a digest so the
++		// summary still knows what the agent actually did.
++		digest, ok := summaryDigest(msg)
++		if !ok {
++			continue
++		}
++		validMessages = append(validMessages, digest)
+ 	}
+ 
+ 	if len(validMessages) == 0 {
+@@ -220,11 +223,15 @@ func (m *legacyContextManager) summarizeSession(agent *AgentInstance, sessionKey
+ 		part1 := validMessages[:mid]
+ 		part2 := validMessages[mid:]
+ 
+-		s1, _ := m.summarizeBatch(ctx, agent, part1, "")
++		// The previous summary is folded into the FIRST part (it is older than
++		// every message in part1), so earlier context is never lost.
++		s1, _ := m.summarizeBatch(ctx, agent, part1, summary)
+ 		s2, _ := m.summarizeBatch(ctx, agent, part2, "")
+ 
+ 		mergePrompt := fmt.Sprintf(
+-			"Merge these two conversation summaries into one cohesive summary:\n\n1: %s\n\n2: %s",
++			"Merge these two conversation summaries (1 is older, 2 is newer) into one cohesive summary. "+
++				"Keep every still-relevant fact: the user's goals and the current task, decisions, file paths, "+
++				"commands, URLs, IDs, results of tool calls, errors and their fixes, and what is still pending.\n\n1: %s\n\n2: %s",
+ 			s1, s2,
+ 		)
+ 
+@@ -334,9 +341,11 @@ func (m *legacyContextManager) summarizeBatch(
+ 	)
+ 
+ 	var sb strings.Builder
+-	sb.WriteString("Provide a concise summary of this conversation segment, preserving core context and key points.\n")
++	sb.WriteString("Provide a concise but complete summary of this conversation segment. Preserve the user's goals and " +
++		"the current task, decisions made, file paths, commands, URLs, IDs, results of tool calls, errors and " +
++		"their fixes, and what is still pending.\n")
+ 	if existingSummary != "" {
+-		sb.WriteString("Existing context: ")
++		sb.WriteString("Existing context (older; keep everything in it that is still relevant): ")
+ 		sb.WriteString(existingSummary)
+ 		sb.WriteString("\n")
+ 	}
+@@ -388,3 +397,62 @@ func (m *legacyContextManager) estimateTokens(messages []providers.Message) int
+ 	}
+ 	return total
+ }
++
++// summaryDigest turns a history message into what the summariser should see.
++// user/assistant text is kept as is; assistant tool calls and tool results are
++// reduced to short one-line digests (they used to be dropped completely, which
++// made the agent forget what it had already done). Other roles are skipped.
++func summaryDigest(msg providers.Message) (providers.Message, bool) {
++	const (
++		maxToolArgRunes    = 150
++		maxToolResultRunes = 300
++	)
++	clip := func(text string, limit int) string {
++		runes := []rune(strings.TrimSpace(text))
++		if len(runes) <= limit {
++			return string(runes)
++		}
++		return string(runes[:limit]) + "..."
++	}
++
++	switch msg.Role {
++	case "user":
++		return msg, true
++	case "assistant":
++		content := msg.Content
++		if len(msg.ToolCalls) > 0 {
++			calls := make([]string, 0, len(msg.ToolCalls))
++			for _, tc := range msg.ToolCalls {
++				name, args := tc.Name, ""
++				if tc.Function != nil {
++					if tc.Function.Name != "" {
++						name = tc.Function.Name
++					}
++					args = tc.Function.Arguments
++				}
++				if name == "" {
++					continue
++				}
++				calls = append(calls, name+"("+clip(args, maxToolArgRunes)+")")
++			}
++			if len(calls) > 0 {
++				if strings.TrimSpace(content) != "" {
++					content += "\n"
++				}
++				content += "[tool calls: " + strings.Join(calls, "; ") + "]"
++			}
++		}
++		if strings.TrimSpace(content) == "" {
++			return msg, false
++		}
++		msg.Content = content
++		return msg, true
++	case "tool":
++		if strings.TrimSpace(msg.Content) == "" {
++			return msg, false
++		}
++		msg.Content = "[tool result] " + clip(msg.Content, maxToolResultRunes)
++		return msg, true
++	}
++	return msg, false
++}

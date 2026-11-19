@@ -13,10 +13,11 @@ Container runs `keep_alive.py` (health, live stats and the PicoClaw route on por
 | `LLM_MODEL` | no | `provider/model`, default `openai/gpt-5.2` |
 | `LLM_API_BASE` | no | custom OpenAI-compatible endpoint |
 | `LLM_REQUEST_TIMEOUT` | no | seconds per LLM request; default and minimum `600` (10 min), can only be raised |
-| `LLM_CONTEXT_WINDOW` | no | model context size in tokens, default `250000` |
-| `LLM_SUMMARIZE_TOKEN_PERCENT` | no | history is summarised (and old messages deleted) only when it fills this % of the context window, default `85` (max 99) |
+| `LLM_CONTEXT_WINDOW` | no | model context size in tokens, default `65536` (smaller window = smaller requests = less TPM usage) |
+| `LLM_SUMMARIZE_TOKEN_PERCENT` | no | history is summarised (and old messages deleted) only when it fills this % of the context window, default `45` (max 99). It is automatically capped so the summary always fires BEFORE PicoClaw's "emergency compression" (which drops half the history without a summary); the cap is printed as a WARNING in `/tmp/setup_picoclaw.log` |
 | `LLM_SUMMARIZE_MESSAGE_THRESHOLD` | no | summarise after this many messages; default `1000000` = off (PicoClaw's own default is 20, which wipes the job context too early) |
-| `LLM_MAX_TOKENS` | no | max output tokens per reply, default `32768` |
+| `LLM_MAX_TOKENS` | no | max output tokens per reply, default `16384` (never more than 1/4 of the context window) |
+| `LLM_PROMPT_RESERVE_TOKENS` | no | tokens kept free for system prompt + tool definitions when capping the summarize percent, default `14000` |
 | `LLM_MAX_TOOL_ITERATIONS` | no | max tool calls per turn, default `100` (was 50) |
 | `LLM_EXTRA_BODY` | no | JSON object merged into every request to your API, e.g. `{"reasoning_effort":"high"}` (only if your API supports it) |
 | `RCLONE_CONFIG_BASE64` | no | Google Drive backup of PicoClaw state |
@@ -197,6 +198,8 @@ action without doing it. Three layers handle that:
 | `LLM_PROXY_ACCESS_LOG` | `0` | `1` = also log every HTTP request line |
 
 Tests (no network needed): `python3 -m unittest -v tests.test_llm_proxy`
+
+**PicoClaw summary patch.** `patches/picoclaw-summary-fix.patch` is applied to PicoClaw v0.3.1 at image build time (see the `picobuild` stage in the `Dockerfile`). It fixes official bugs in `pkg/agent/context_legacy.go`: (1) when more than 10 messages were summarised, the *previous* summary was thrown away and overwritten, so every summarisation forgot everything before it; (2) tool calls and tool results were dropped from the summary completely; (3) the 120 s summarisation timeout was too short for a slow custom API (now 600 s); (4) the summary prompt now asks to keep goals, paths, commands, results and pending work. If the patched build fails (e.g. low build RAM) the Dockerfile silently falls back to the unpatched release binary; `cat /etc/picoclaw-version` shows `v0.3.1+summaryfix` when the patch is active. Use `--build-arg PICOCLAW_PATCH=off` to skip it.
 
 Note: `Setup Picoclaw.py` (with a space) is an old copy and is not used by the Dockerfile; `setup_picoclaw.py` is the live one.
 

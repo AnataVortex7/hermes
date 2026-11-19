@@ -276,20 +276,41 @@ def main() -> None:
             return default
 
     # Context window of the custom API (tokens the model can see). Without this PicoClaw
-    # assumes max_tokens*4 (= only ~32k) and summarizes the history far too early.
-    context_window = env_int("LLM_CONTEXT_WINDOW", 250000)
-    # Max OUTPUT tokens per reply (not the context size).
-    max_tokens = env_int("LLM_MAX_TOKENS", 32768)
+    # assumes max_tokens*4 and summarizes the history far too early / far too late.
+    # Defaults are tuned for a 64K-context custom API with a ~250k TPM limit: every agent step re-sends the whole
+    # history, so a smaller window keeps each request (and the tokens-per-minute usage) small.
+    context_window = env_int("LLM_CONTEXT_WINDOW", 65536)
+    # Max OUTPUT tokens per reply (not the context size). Never more than 1/4 of the window: PicoClaw reserves
+    # max_tokens inside the window, so a huge value leaves too little room for the history.
+    max_tokens = env_int("LLM_MAX_TOKENS", 16384)
+    if max_tokens > context_window // 4:
+        print(f"WARNING: LLM_MAX_TOKENS={max_tokens} is more than 1/4 of LLM_CONTEXT_WINDOW={context_window}; "
+              f"lowering it to {context_window // 4}")
+        max_tokens = context_window // 4
 
-    # History summarising (PicoClaw "maybeSummarize"): after every turn PicoClaw summarises + PHYSICALLY DELETES old
+    # History summarising (PicoClaw "maybeSummarize"): after a turn PicoClaw summarises + PHYSICALLY DELETES old
     # messages when len(history) > summarize_message_threshold (PicoClaw default 20!) or the history is above
-    # summarize_token_percent % of the context window. With the default 20 this fires after a few tool calls, the
-    # summary is lossy (tool calls/results are not part of it) and the agent forgets the job.
-    # So: the message-count trigger is effectively OFF (a huge number; 0 would fall back to the default 20) and the
-    # summary only runs when the history really fills the context window (default 85 %, was 75 %).
+    # summarize_token_percent % of the context window. With the default 20 this fires after a few tool calls and the
+    # agent forgets the job. So: the message-count trigger is effectively OFF (a huge number; 0 would fall back to
+    # the default 20) and the summary only runs when the history really fills the window.
     # LLM_SUMMARIZE_MESSAGE_THRESHOLD / LLM_SUMMARIZE_TOKEN_PERCENT override this (token percent: 1-99).
     summarize_message_threshold = env_int("LLM_SUMMARIZE_MESSAGE_THRESHOLD", 1_000_000)
-    summarize_token_percent = min(env_int("LLM_SUMMARIZE_TOKEN_PERCENT", 85), 99)
+    summarize_token_percent = min(env_int("LLM_SUMMARIZE_TOKEN_PERCENT", 45), 99)
+
+    # GUARD against "emergency compression": before every LLM call PicoClaw checks
+    #     history + system prompt + tool definitions + max_tokens  >  context_window
+    # and if so it silently DROPS ~50% of the history (no summary, only a note). The summary trigger
+    # (summarize_token_percent % of the window, history only) must therefore fire BEFORE that happens, so the percent
+    # is capped at what is left after max_tokens and a reserve for system prompt + tool definitions.
+    # A wrong env value (e.g. 85 with a 250k window / 32k max_tokens) can no longer cause history loss.
+    prompt_reserve = env_int("LLM_PROMPT_RESERVE_TOKENS", 14000)
+    safe_percent = (context_window - max_tokens - prompt_reserve) * 100 // context_window
+    safe_percent = max(10, min(safe_percent, 99))
+    if summarize_token_percent > safe_percent:
+        print(f"WARNING: LLM_SUMMARIZE_TOKEN_PERCENT={summarize_token_percent} is too high for context_window="
+              f"{context_window} / max_tokens={max_tokens} (emergency compression would drop history first); "
+              f"using {safe_percent}")
+        summarize_token_percent = safe_percent
 
     cron_allowed_remotes = [
         x.strip()
