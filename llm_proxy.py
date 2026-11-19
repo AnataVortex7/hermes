@@ -42,6 +42,11 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+try:                                      # Telegram /log command (logs zip), see log_command.py
+    import log_command
+except Exception:  # noqa: BLE001 - the proxy must start even if this optional file is missing
+    log_command = None
+
 
 def _env_int(name, default):
     try:
@@ -1376,6 +1381,11 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
 
         target_url = build_upstream_url(self.path)
         try:
+            # "/log" typed in Telegram: answered here (logs zip -> Telegram), the real LLM is never called.
+            if payload is not None and is_chat and log_command is not None and log_command.is_log_command(payload):
+                log("/log command: bundling logs and sending them to Telegram")
+                self._reply_log_command(payload, client_wants_stream)
+                return
             # Every chat call (agent turns AND background calls such as PicoClaw's history summary, which has no
             # tools) goes through the same path: keep-alive pings, retries and the full time budget. Only the reply
             # validation is limited to agent turns (guard_on inside _guarded_chat_inner).
@@ -1411,6 +1421,22 @@ class GuardProxyHandler(BaseHTTPRequestHandler):
                     self._send_json(502, {"error": {"message": f"stream_proxy error: {exc}"}})
             except Exception:  # noqa: BLE001
                 pass
+
+    def _reply_log_command(self, payload, as_stream):
+        try:
+            text = log_command.run()
+        except Exception as exc:  # noqa: BLE001
+            log(f"/log failed: {exc!r}")
+            text = f"❌ /log फेल: {exc!r}"[:300]
+        comp = {"id": "chatcmpl-logcmd", "object": "chat.completion", "model": str(payload.get("model") or ""),
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+        self._sse_open = False
+        self._client_gone = False
+        if as_stream:
+            self._send_sse(comp)
+        else:
+            self._send_json(200, comp)
 
     def _passthrough(self, target_url, body, client_wants_stream):
         conn, resp = open_upstream(self.command, target_url, self._forward_headers(body), body,

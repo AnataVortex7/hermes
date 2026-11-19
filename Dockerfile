@@ -77,6 +77,7 @@ COPY start.sh /app/start.sh
 COPY setup_picoclaw.py /app/setup_picoclaw.py
 COPY llm_proxy.py /app/llm_proxy.py
 COPY notify.py /app/notify.py
+COPY log_command.py /app/log_command.py
 RUN chmod +x /app/start.sh
 
 COPY bin/ /app/bin/

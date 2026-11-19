@@ -2,6 +2,11 @@
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 export TZ="Asia/Kolkata"
 
+# Mirror everything this script prints (= what the Render/Koyeb log page shows) into /tmp/server.log, so the
+# Telegram /log command can send the complete server log. Output still goes to the platform log unchanged.
+rm -f /tmp/server.log
+exec > >(tee -a /tmp/server.log) 2>&1
+
 echo "=== [PicoW Clow Koyeb Instant Startup & Background Sync] ==="
 
 rm -f /tmp/shutting_down /tmp/restore_progress.json /tmp/restore.log /tmp/setup_picoclaw.log /tmp/picoclaw.log /tmp/stream_proxy.log /tmp/backup_now /tmp/backup_status.json
@@ -381,6 +386,7 @@ trap cleanup SIGTERM SIGINT EXIT
 # 6. Start PicoClaw gateway (Telegram long-polling, no inbound port needed)
 if command -v picoclaw >/dev/null 2>&1 && run_logged /tmp/setup_picoclaw.log python3 /app/setup_picoclaw.py; then
   echo ">> Starting PicoClaw gateway (Telegram)..."
+  echo ">> PicoClaw build: $(cat /etc/picoclaw-version 2>/dev/null || echo unknown)  (\"+summaryfix\" = summary patch active)"
   : > /tmp/picoclaw.log
   tail -n +1 -f /tmp/picoclaw.log &
   TAIL_PID=$!
